@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+nba_api
+pandas
+streamlit
+requests
+matplotlib
+unidecode
+

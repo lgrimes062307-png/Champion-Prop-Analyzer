@@ -9,6 +9,12 @@ import urllib.parse
 st.set_page_config(layout="wide")
 st.title("NBA Prop Analyzer")
 
+
+def render_table_html(df: pd.DataFrame):
+    # Avoid Arrow serialization (LargeUtf8) by rendering as HTML
+    st.markdown(df.to_html(index=False, escape=True), unsafe_allow_html=True)
+
+
 BACKEND_URL = st.sidebar.text_input("Backend URL", "http://localhost:8000/analyze")
 SUBSCRIBE_URL = st.sidebar.text_input("Subscribe URL Endpoint", "http://localhost:8000/create-checkout-session")
 STATUS_URL = st.sidebar.text_input("Subscription Status Endpoint", "http://localhost:8000/subscription-status")
@@ -93,10 +99,32 @@ if "conf_h2h_good" not in st.session_state:
 if "conf_low_max" not in st.session_state:
     st.session_state["conf_low_max"] = all_presets[preset]["conf_low_max"]
 
-season_type = st.sidebar.selectbox("Season Type", ["Regular Season", "Playoffs"], index=["Regular Season", "Playoffs"].index(st.session_state["season_type"]), key="season_type")
-window_1 = st.sidebar.slider("Last 5 Games (adjustable)", min_value=1, max_value=30, value=st.session_state["window_1"], key="window_1")
-window_2 = st.sidebar.slider("Last 10 Games (adjustable)", min_value=1, max_value=50, value=st.session_state["window_2"], key="window_2")
-hit_operator = st.sidebar.selectbox("Hit Operator", ["gt", "gte"], index=["gt", "gte"].index(st.session_state["hit_operator"]), key="hit_operator")
+season_type = st.sidebar.selectbox(
+    "Season Type",
+    ["Regular Season", "Playoffs"],
+    index=["Regular Season", "Playoffs"].index(st.session_state["season_type"]),
+    key="season_type",
+)
+window_1 = st.sidebar.slider(
+    "Last 5 Games (adjustable)",
+    min_value=1,
+    max_value=30,
+    value=st.session_state["window_1"],
+    key="window_1",
+)
+window_2 = st.sidebar.slider(
+    "Last 10 Games (adjustable)",
+    min_value=1,
+    max_value=50,
+    value=st.session_state["window_2"],
+    key="window_2",
+)
+hit_operator = st.sidebar.selectbox(
+    "Hit Operator",
+    ["gt", "gte"],
+    index=["gt", "gte"].index(st.session_state["hit_operator"]),
+    key="hit_operator",
+)
 
 st.sidebar.markdown("### Model Tuning")
 conf_l5_min = st.sidebar.slider("Conf L5 Min", min_value=0, max_value=100, value=st.session_state["conf_l5_min"], key="conf_l5_min")
@@ -413,11 +441,11 @@ if st.button("Evaluate"):
                 if table[col].dtype.name == "string":
                     table[col] = table[col].astype(str)
             table_sorted = table.sort_values("Confidence", ascending=False)
-            st.dataframe(table_sorted, use_container_width=True)
+            render_table_html(table_sorted)
 
             st.subheader("Top Picks")
             if len(table_sorted) <= 1:
-                st.dataframe(table_sorted.head(1), use_container_width=True)
+                render_table_html(table_sorted.head(1))
             else:
                 top_n = st.slider(
                     "Number of picks",
@@ -425,7 +453,7 @@ if st.button("Evaluate"):
                     max_value=min(10, len(table_sorted)),
                     value=min(3, len(table_sorted)),
                 )
-                st.dataframe(table_sorted.head(top_n), use_container_width=True)
+                render_table_html(table_sorted.head(top_n))
 
             with st.expander("History"):
                 if st.button("Clear History"):
@@ -435,7 +463,9 @@ if st.button("Evaluate"):
                     for col in hist.columns:
                         if hist[col].dtype.name == "string":
                             hist[col] = hist[col].astype(str)
-                    st.dataframe(hist, use_container_width=True)
+                    render_table_html(hist)
                 else:
                     st.write("No history yet.")
+
+
 

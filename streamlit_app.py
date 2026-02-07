@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 import pandas as pd
-import altair as alt
 import datetime
 import os
 import urllib.parse
@@ -11,8 +10,26 @@ st.title("NBA Prop Analyzer")
 
 
 def render_table_html(df: pd.DataFrame):
-    # Avoid Arrow serialization (LargeUtf8) by rendering as HTML
     st.markdown(df.to_html(index=False, escape=True), unsafe_allow_html=True)
+
+
+def render_hit_rate_chart(data_rows):
+    spec = {
+        "mark": "bar",
+        "encoding": {
+            "x": {"field": "Window", "type": "nominal", "sort": ["Last 5", "Last 10", "H2H"]},
+            "y": {"field": "Hit Rate (%)", "type": "quantitative", "scale": {"domain": [0, 100]}},
+            "tooltip": [
+                {"field": "Window", "type": "nominal"},
+                {"field": "Hit Rate (%)", "type": "quantitative", "format": ".2f"},
+                {"field": "Avg Stat", "type": "quantitative", "format": ".2f"},
+                {"field": "Low", "type": "quantitative", "format": ".2f"},
+                {"field": "High", "type": "quantitative", "format": ".2f"},
+            ],
+        },
+        "data": {"values": data_rows},
+    }
+    st.vega_lite_chart(spec, use_container_width=True)
 
 
 BACKEND_URL = st.sidebar.text_input("Backend URL", "http://localhost:8000/analyze")
@@ -105,20 +122,8 @@ season_type = st.sidebar.selectbox(
     index=["Regular Season", "Playoffs"].index(st.session_state["season_type"]),
     key="season_type",
 )
-window_1 = st.sidebar.slider(
-    "Last 5 Games (adjustable)",
-    min_value=1,
-    max_value=30,
-    value=st.session_state["window_1"],
-    key="window_1",
-)
-window_2 = st.sidebar.slider(
-    "Last 10 Games (adjustable)",
-    min_value=1,
-    max_value=50,
-    value=st.session_state["window_2"],
-    key="window_2",
-)
+window_1 = st.sidebar.slider("Last 5 Games (adjustable)", 1, 30, st.session_state["window_1"], key="window_1")
+window_2 = st.sidebar.slider("Last 10 Games (adjustable)", 1, 50, st.session_state["window_2"], key="window_2")
 hit_operator = st.sidebar.selectbox(
     "Hit Operator",
     ["gt", "gte"],
@@ -127,10 +132,10 @@ hit_operator = st.sidebar.selectbox(
 )
 
 st.sidebar.markdown("### Model Tuning")
-conf_l5_min = st.sidebar.slider("Conf L5 Min", min_value=0, max_value=100, value=st.session_state["conf_l5_min"], key="conf_l5_min")
-conf_l10_min = st.sidebar.slider("Conf L10 Min", min_value=0, max_value=100, value=st.session_state["conf_l10_min"], key="conf_l10_min")
-conf_h2h_good = st.sidebar.slider("Conf H2H Good", min_value=0, max_value=100, value=st.session_state["conf_h2h_good"], key="conf_h2h_good")
-conf_low_max = st.sidebar.slider("Conf Low Max", min_value=0, max_value=100, value=st.session_state["conf_low_max"], key="conf_low_max")
+conf_l5_min = st.sidebar.slider("Conf L5 Min", 0, 100, st.session_state["conf_l5_min"], key="conf_l5_min")
+conf_l10_min = st.sidebar.slider("Conf L10 Min", 0, 100, st.session_state["conf_l10_min"], key="conf_l10_min")
+conf_h2h_good = st.sidebar.slider("Conf H2H Good", 0, 100, st.session_state["conf_h2h_good"], key="conf_h2h_good")
+conf_low_max = st.sidebar.slider("Conf Low Max", 0, 100, st.session_state["conf_low_max"], key="conf_low_max")
 
 st.sidebar.markdown("### Save Preset")
 preset_name = st.sidebar.text_input("Preset Name", "")
@@ -360,64 +365,32 @@ if st.button("Evaluate"):
         else:
             st.info("Free preview: upgrade to see full analysis, reasons, and comparisons.")
 
-        chart_data = pd.DataFrame([
+        chart_data = [
             {
                 "Window": "Last 5",
-                "Hit Rate (%)": best["last_5_hit_rate"],
-                "Avg Stat": best["last_5_avg_stat"],
-                "Low": best["last_5_ci"][0],
-                "High": best["last_5_ci"][1],
+                "Hit Rate (%)": float(best["last_5_hit_rate"]),
+                "Avg Stat": float(best["last_5_avg_stat"]),
+                "Low": float(best["last_5_ci"][0]),
+                "High": float(best["last_5_ci"][1]),
             },
             {
                 "Window": "Last 10",
-                "Hit Rate (%)": best["last_10_hit_rate"],
-                "Avg Stat": best["last_10_avg_stat"],
-                "Low": best["last_10_ci"][0],
-                "High": best["last_10_ci"][1],
+                "Hit Rate (%)": float(best["last_10_hit_rate"]),
+                "Avg Stat": float(best["last_10_avg_stat"]),
+                "Low": float(best["last_10_ci"][0]),
+                "High": float(best["last_10_ci"][1]),
             },
             {
                 "Window": "H2H",
-                "Hit Rate (%)": best["h2h_hit_rate"],
-                "Avg Stat": best["h2h_avg_stat"],
-                "Low": best["h2h_ci"][0],
-                "High": best["h2h_ci"][1],
+                "Hit Rate (%)": float(best["h2h_hit_rate"]),
+                "Avg Stat": float(best["h2h_avg_stat"]),
+                "Low": float(best["h2h_ci"][0]),
+                "High": float(best["h2h_ci"][1]),
             },
-        ])
-        # Avoid Arrow LargeUtf8 serialization issues in Streamlit
-        for col in ["Window"]:
-            chart_data[col] = chart_data[col].astype(str)
-        for col in ["Hit Rate (%)", "Avg Stat", "Low", "High"]:
-            chart_data[col] = pd.to_numeric(chart_data[col], errors="coerce").fillna(0.0)
+        ]
 
         st.subheader("Hit Rate Overview")
-        bars = (
-            alt.Chart(chart_data)
-            .mark_bar()
-            .encode(
-                x=alt.X("Window:N", sort=["Last 5", "Last 10", "H2H"]),
-                y=alt.Y("Hit Rate (%):Q", scale=alt.Scale(domain=[0, 100])),
-                tooltip=[
-                    alt.Tooltip("Window:N"),
-                    alt.Tooltip("Hit Rate (%):Q", format=".2f"),
-                    alt.Tooltip("Avg Stat:Q", format=".2f"),
-                    alt.Tooltip("Low:Q", format=".2f"),
-                    alt.Tooltip("High:Q", format=".2f"),
-                ],
-            )
-        )
-        if is_active:
-            error = (
-                alt.Chart(chart_data)
-                .mark_errorbar()
-                .encode(
-                    x=alt.X("Window:N", sort=["Last 5", "Last 10", "H2H"]),
-                    y=alt.Y("Low:Q"),
-                    y2=alt.Y2("High:Q"),
-                )
-            )
-            st.altair_chart(bars + error, use_container_width=True)
-        else:
-            st.altair_chart(bars, use_container_width=True)
+        render_hit_rate_chart(chart_data)
 
         if is_active:
             st.subheader("Comparison Table")
@@ -436,10 +409,6 @@ if st.button("Evaluate"):
                 }
                 for r in results
             ])
-            # Force string columns to plain object dtype for Streamlit compatibility
-            for col in table.columns:
-                if table[col].dtype.name == "string":
-                    table[col] = table[col].astype(str)
             table_sorted = table.sort_values("Confidence", ascending=False)
             render_table_html(table_sorted)
 
@@ -460,12 +429,10 @@ if st.button("Evaluate"):
                     st.session_state["history"] = []
                 if st.session_state["history"]:
                     hist = pd.DataFrame(st.session_state["history"])
-                    for col in hist.columns:
-                        if hist[col].dtype.name == "string":
-                            hist[col] = hist[col].astype(str)
                     render_table_html(hist)
                 else:
                     st.write("No history yet.")
+
 
 
 

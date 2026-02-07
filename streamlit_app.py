@@ -355,6 +355,11 @@ if st.button("Evaluate"):
                 "High": best["h2h_ci"][1],
             },
         ])
+        # Avoid Arrow LargeUtf8 serialization issues in Streamlit
+        for col in ["Window"]:
+            chart_data[col] = chart_data[col].astype(str)
+        for col in ["Hit Rate (%)", "Avg Stat", "Low", "High"]:
+            chart_data[col] = pd.to_numeric(chart_data[col], errors="coerce").fillna(0.0)
 
         st.subheader("Hit Rate Overview")
         bars = (
@@ -403,6 +408,10 @@ if st.button("Evaluate"):
                 }
                 for r in results
             ])
+            # Force string columns to plain object dtype for Streamlit compatibility
+            for col in table.columns:
+                if table[col].dtype.name == "string":
+                    table[col] = table[col].astype(str)
             table_sorted = table.sort_values("Confidence", ascending=False)
             st.dataframe(table_sorted, use_container_width=True)
 
@@ -423,6 +432,10 @@ if st.button("Evaluate"):
                     st.session_state["history"] = []
                 if st.session_state["history"]:
                     hist = pd.DataFrame(st.session_state["history"])
+                    for col in hist.columns:
+                        if hist[col].dtype.name == "string":
+                            hist[col] = hist[col].astype(str)
                     st.dataframe(hist, use_container_width=True)
                 else:
                     st.write("No history yet.")
+

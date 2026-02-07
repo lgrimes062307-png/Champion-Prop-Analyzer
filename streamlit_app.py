@@ -9,7 +9,7 @@ import urllib.parse
 st.set_page_config(layout="wide")
 st.title("NBA Prop Analyzer")
 
-BACKEND_URL = st.sidebar.text_input("Backend URL", "http://localhost:8000/evaluate")
+BACKEND_URL = st.sidebar.text_input("Backend URL", "http://localhost:8000/analyze")
 SUBSCRIBE_URL = st.sidebar.text_input("Subscribe URL Endpoint", "http://localhost:8000/create-checkout-session")
 STATUS_URL = st.sidebar.text_input("Subscription Status Endpoint", "http://localhost:8000/subscription-status")
 PORTAL_URL = st.sidebar.text_input("Manage Subscription Endpoint", "http://localhost:8000/create-portal-session")

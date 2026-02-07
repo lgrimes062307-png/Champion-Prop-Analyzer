@@ -1,6 +1,5 @@
 import streamlit as st
 import requests
-import pandas as pd
 import datetime
 import os
 import urllib.parse
@@ -9,27 +8,35 @@ st.set_page_config(layout="wide")
 st.title("NBA Prop Analyzer")
 
 
-def render_table_html(df: pd.DataFrame):
-    st.markdown(df.to_html(index=False, escape=True), unsafe_allow_html=True)
+def render_table_html(rows, columns):
+    if not rows:
+        st.write("No data.")
+        return
+    header = "".join(f"<th>{c}</th>" for c in columns)
+    body_rows = []
+    for r in rows:
+        body_rows.append("<tr>" + "".join(f"<td>{r.get(c, '')}</td>" for c in columns) + "</tr>")
+    html = f"<table><thead><tr>{header}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    st.markdown(html, unsafe_allow_html=True)
 
 
-def render_hit_rate_chart(data_rows):
-    spec = {
-        "mark": "bar",
-        "encoding": {
-            "x": {"field": "Window", "type": "nominal", "sort": ["Last 5", "Last 10", "H2H"]},
-            "y": {"field": "Hit Rate (%)", "type": "quantitative", "scale": {"domain": [0, 100]}},
-            "tooltip": [
-                {"field": "Window", "type": "nominal"},
-                {"field": "Hit Rate (%)", "type": "quantitative", "format": ".2f"},
-                {"field": "Avg Stat", "type": "quantitative", "format": ".2f"},
-                {"field": "Low", "type": "quantitative", "format": ".2f"},
-                {"field": "High", "type": "quantitative", "format": ".2f"},
-            ],
-        },
-        "data": {"values": data_rows},
-    }
-    st.vega_lite_chart(spec, use_container_width=True)
+def render_hit_rate_bars(rows):
+    if not rows:
+        st.write("No chart data.")
+        return
+    st.markdown("**Hit Rate Overview**")
+    for r in rows:
+        label = r.get("Window", "")
+        val = float(r.get("Hit Rate (%)", 0))
+        val = max(0.0, min(100.0, val))
+        st.markdown(
+            f"<div style='margin:6px 0;'>"
+            f"<div style='font-size:14px;margin-bottom:2px;'>{label}: {val:.2f}%</div>"
+            f"<div style='background:#eee;border-radius:6px;overflow:hidden;height:12px;'>"
+            f"<div style='width:{val}%;background:#2e86de;height:12px;'></div>"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
 
 
 BACKEND_URL = st.sidebar.text_input("Backend URL", "http://localhost:8000/analyze")
@@ -42,36 +49,12 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "")
 
 DEFAULT_PRESETS = {
-    "Default": {
-        "season_type": "Regular Season",
-        "window_1": 5,
-        "window_2": 10,
-        "hit_operator": "gt",
-        "conf_l5_min": 50,
-        "conf_l10_min": 50,
-        "conf_h2h_good": 60,
-        "conf_low_max": 40,
-    },
-    "Aggressive": {
-        "season_type": "Regular Season",
-        "window_1": 5,
-        "window_2": 10,
-        "hit_operator": "gt",
-        "conf_l5_min": 55,
-        "conf_l10_min": 55,
-        "conf_h2h_good": 65,
-        "conf_low_max": 35,
-    },
-    "Conservative": {
-        "season_type": "Regular Season",
-        "window_1": 7,
-        "window_2": 15,
-        "hit_operator": "gte",
-        "conf_l5_min": 60,
-        "conf_l10_min": 60,
-        "conf_h2h_good": 70,
-        "conf_low_max": 45,
-    },
+    "Default": {"season_type": "Regular Season", "window_1": 5, "window_2": 10, "hit_operator": "gt",
+                "conf_l5_min": 50, "conf_l10_min": 50, "conf_h2h_good": 60, "conf_low_max": 40},
+    "Aggressive": {"season_type": "Regular Season", "window_1": 5, "window_2": 10, "hit_operator": "gt",
+                   "conf_l5_min": 55, "conf_l10_min": 55, "conf_h2h_good": 65, "conf_low_max": 35},
+    "Conservative": {"season_type": "Regular Season", "window_1": 7, "window_2": 15, "hit_operator": "gte",
+                     "conf_l5_min": 60, "conf_l10_min": 60, "conf_h2h_good": 70, "conf_low_max": 45},
 }
 
 if "custom_presets" not in st.session_state:
@@ -99,22 +82,9 @@ if preset != st.session_state["last_preset"]:
     st.session_state["conf_low_max"] = p["conf_low_max"]
     st.session_state["last_preset"] = preset
 
-if "season_type" not in st.session_state:
-    st.session_state["season_type"] = all_presets[preset]["season_type"]
-if "window_1" not in st.session_state:
-    st.session_state["window_1"] = all_presets[preset]["window_1"]
-if "window_2" not in st.session_state:
-    st.session_state["window_2"] = all_presets[preset]["window_2"]
-if "hit_operator" not in st.session_state:
-    st.session_state["hit_operator"] = all_presets[preset]["hit_operator"]
-if "conf_l5_min" not in st.session_state:
-    st.session_state["conf_l5_min"] = all_presets[preset]["conf_l5_min"]
-if "conf_l10_min" not in st.session_state:
-    st.session_state["conf_l10_min"] = all_presets[preset]["conf_l10_min"]
-if "conf_h2h_good" not in st.session_state:
-    st.session_state["conf_h2h_good"] = all_presets[preset]["conf_h2h_good"]
-if "conf_low_max" not in st.session_state:
-    st.session_state["conf_low_max"] = all_presets[preset]["conf_low_max"]
+for key in ["season_type", "window_1", "window_2", "hit_operator", "conf_l5_min", "conf_l10_min", "conf_h2h_good", "conf_low_max"]:
+    if key not in st.session_state:
+        st.session_state[key] = all_presets[preset][key]
 
 season_type = st.sidebar.selectbox(
     "Season Type",
@@ -157,24 +127,14 @@ NBA_TEAMS = [
     "DEN", "DET", "GSW", "HOU", "IND", "LAC", "LAL",
     "MEM", "MIA", "MIL", "MIN", "NOP", "NYK", "OKC",
     "ORL", "PHI", "PHX", "POR", "SAC", "SAS", "TOR",
-    "UTA", "WAS"
+    "UTA", "WAS",
 ]
 
 player = st.text_input("Player Name", "LeBron James")
-
 prop = st.selectbox(
     "Prop Type",
-    [
-        "points",
-        "rebounds",
-        "assists",
-        "points+assists",
-        "points+rebounds",
-        "rebounds+assists",
-        "pra"
-    ]
+    ["points", "rebounds", "assists", "points+assists", "points+rebounds", "rebounds+assists", "pra"],
 )
-
 line = st.number_input("Prop Line", value=25.5)
 opponent = st.selectbox("Opponent (for H2H & DvP)", NBA_TEAMS)
 
@@ -208,12 +168,7 @@ if code and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI
     st.experimental_set_query_params()
 
 if DISCORD_CLIENT_ID and DISCORD_REDIRECT_URI:
-    params = {
-        "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": DISCORD_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "identify",
-    }
+    params = {"client_id": DISCORD_CLIENT_ID, "redirect_uri": DISCORD_REDIRECT_URI, "response_type": "code", "scope": "identify"}
     auth_url = "https://discord.com/api/oauth2/authorize?" + urllib.parse.urlencode(params)
     st.markdown(f"[Connect Discord]({auth_url})")
 else:
@@ -303,7 +258,7 @@ if st.button("Evaluate"):
                         "conf_h2h_good": conf_h2h_good,
                         "conf_low_max": conf_low_max,
                     },
-                    timeout=20,
+                    timeout=30,
                 )
                 try:
                     res = resp.json()
@@ -318,25 +273,10 @@ if st.button("Evaluate"):
                     st.stop()
                 results.append(res)
 
-        if is_active:
-            if "history" not in st.session_state:
-                st.session_state["history"] = []
-            for r in results:
-                st.session_state["history"].append({
-                    "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "player": r["player"],
-                    "prop": r["prop"],
-                    "line": r["line"],
-                    "confidence": r["confidence"],
-                    "recommendation": r["recommendation"],
-                    "last_5_hit_rate": r["last_5_hit_rate"],
-                    "last_10_hit_rate": r["last_10_hit_rate"],
-                    "h2h_hit_rate": r["h2h_hit_rate"],
-                })
-
         if not results:
             st.error("No results returned from backend.")
             st.stop()
+
         best = max(results, key=lambda r: r["confidence"])
 
         st.subheader(f"Recommendation: {best['recommendation']}")
@@ -366,36 +306,21 @@ if st.button("Evaluate"):
             st.info("Free preview: upgrade to see full analysis, reasons, and comparisons.")
 
         chart_data = [
-            {
-                "Window": "Last 5",
-                "Hit Rate (%)": float(best["last_5_hit_rate"]),
-                "Avg Stat": float(best["last_5_avg_stat"]),
-                "Low": float(best["last_5_ci"][0]),
-                "High": float(best["last_5_ci"][1]),
-            },
-            {
-                "Window": "Last 10",
-                "Hit Rate (%)": float(best["last_10_hit_rate"]),
-                "Avg Stat": float(best["last_10_avg_stat"]),
-                "Low": float(best["last_10_ci"][0]),
-                "High": float(best["last_10_ci"][1]),
-            },
-            {
-                "Window": "H2H",
-                "Hit Rate (%)": float(best["h2h_hit_rate"]),
-                "Avg Stat": float(best["h2h_avg_stat"]),
-                "Low": float(best["h2h_ci"][0]),
-                "High": float(best["h2h_ci"][1]),
-            },
+            {"Window": "Last 5", "Hit Rate (%)": float(best["last_5_hit_rate"]), "Avg Stat": float(best["last_5_avg_stat"]),
+             "Low": float(best["last_5_ci"][0]), "High": float(best["last_5_ci"][1])},
+            {"Window": "Last 10", "Hit Rate (%)": float(best["last_10_hit_rate"]), "Avg Stat": float(best["last_10_avg_stat"]),
+             "Low": float(best["last_10_ci"][0]), "High": float(best["last_10_ci"][1])},
+            {"Window": "H2H", "Hit Rate (%)": float(best["h2h_hit_rate"]), "Avg Stat": float(best["h2h_avg_stat"]),
+             "Low": float(best["h2h_ci"][0]), "High": float(best["h2h_ci"][1])},
         ]
 
-        st.subheader("Hit Rate Overview")
-        render_hit_rate_chart(chart_data)
+        render_hit_rate_bars(chart_data)
 
         if is_active:
             st.subheader("Comparison Table")
-            table = pd.DataFrame([
-                {
+            rows = []
+            for r in results:
+                rows.append({
                     "Prop": r["prop"],
                     "Line": r["line"],
                     "Confidence": r["confidence"],
@@ -406,30 +331,20 @@ if st.button("Evaluate"):
                     "L5 CI": f"{r['last_5_ci'][0]}-{r['last_5_ci'][1]}",
                     "L10 CI": f"{r['last_10_ci'][0]}-{r['last_10_ci'][1]}",
                     "H2H CI": f"{r['h2h_ci'][0]}-{r['h2h_ci'][1]}",
-                }
-                for r in results
-            ])
-            table_sorted = table.sort_values("Confidence", ascending=False)
-            render_table_html(table_sorted)
+                })
+            rows = sorted(rows, key=lambda x: x["Confidence"], reverse=True)
+            columns = ["Prop", "Line", "Confidence", "Rec", "L5 Hit%", "L10 Hit%", "H2H Hit%", "L5 CI", "L10 CI", "H2H CI"]
+            render_table_html(rows, columns)
 
             st.subheader("Top Picks")
-            if len(table_sorted) <= 1:
-                render_table_html(table_sorted.head(1))
-            else:
-                top_n = st.slider(
-                    "Number of picks",
-                    min_value=1,
-                    max_value=min(10, len(table_sorted)),
-                    value=min(3, len(table_sorted)),
-                )
-                render_table_html(table_sorted.head(top_n))
+            top_n = 1 if len(rows) <= 1 else st.slider("Number of picks", 1, min(10, len(rows)), min(3, len(rows)))
+            render_table_html(rows[:top_n], columns)
 
             with st.expander("History"):
                 if st.button("Clear History"):
                     st.session_state["history"] = []
                 if st.session_state["history"]:
-                    hist = pd.DataFrame(st.session_state["history"])
-                    render_table_html(hist)
+                    render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
                 else:
                     st.write("No history yet.")
 

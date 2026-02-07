@@ -55,3 +55,4 @@ def analyze_prop(
         "minutes_proj": minutes_proj,
         "dvp": dvp
     }
+

@@ -254,7 +254,7 @@ if st.button("Evaluate"):
         results = []
         for p in compare_props:
             for ln in lines:
-                res = requests.get(
+                resp = requests.get(
                     BACKEND_URL,
                     params={
                         "player": player,
@@ -269,8 +269,20 @@ if st.button("Evaluate"):
                         "conf_l10_min": conf_l10_min,
                         "conf_h2h_good": conf_h2h_good,
                         "conf_low_max": conf_low_max,
-                    }
-                ).json()
+                    },
+                    timeout=20,
+                )
+                try:
+                    res = resp.json()
+                except Exception:
+                    st.error("Backend returned an invalid response. Check your Backend URL and backend logs.")
+                    st.stop()
+                if "error" in res:
+                    st.error(res["error"])
+                    st.stop()
+                if "confidence" not in res:
+                    st.error("Backend response is missing expected fields. Check backend deployment.")
+                    st.stop()
                 results.append(res)
 
         if is_active:
@@ -289,6 +301,9 @@ if st.button("Evaluate"):
                     "h2h_hit_rate": r["h2h_hit_rate"],
                 })
 
+        if not results:
+            st.error("No results returned from backend.")
+            st.stop()
         best = max(results, key=lambda r: r["confidence"])
 
         st.subheader(f"Recommendation: {best['recommendation']}")

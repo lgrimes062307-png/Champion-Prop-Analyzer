@@ -141,6 +141,10 @@ opponent = st.selectbox("Opponent (for H2H & DvP)", NBA_TEAMS)
 st.subheader("Paid Access")
 if "discord_user_id" not in st.session_state:
     st.session_state["discord_user_id"] = ""
+if "free_eval_date" not in st.session_state:
+    st.session_state["free_eval_date"] = ""
+if "free_eval_count" not in st.session_state:
+    st.session_state["free_eval_count"] = 0
 
 query = st.experimental_get_query_params()
 code = query.get("code", [None])[0]
@@ -185,7 +189,12 @@ else:
     is_active = False
 
 if not is_active:
-    st.info("Free preview: upgrade to unlock full analysis, comparisons, top picks, and history.")
+    today = datetime.date.today().isoformat()
+    if st.session_state["free_eval_date"] != today:
+        st.session_state["free_eval_date"] = today
+        st.session_state["free_eval_count"] = 0
+    remaining = max(0, 1 - st.session_state["free_eval_count"])
+    st.info(f"Free preview: {remaining} evaluation left today. Upgrade to unlock full analysis, comparisons, top picks, and history.")
 
 if st.button("Generate Checkout Link"):
     if not discord_user_id:
@@ -224,6 +233,13 @@ else:
 if st.button("Evaluate"):
     with st.spinner("Running analysis..."):
         if not is_active:
+            today = datetime.date.today().isoformat()
+            if st.session_state["free_eval_date"] != today:
+                st.session_state["free_eval_date"] = today
+                st.session_state["free_eval_count"] = 0
+            if st.session_state["free_eval_count"] >= 1:
+                st.error("Free limit reached for today. Please upgrade to continue.")
+                st.stop()
             compare_props = [prop]
             compare_lines_raw = str(line)
 
@@ -276,6 +292,8 @@ if st.button("Evaluate"):
         if not results:
             st.error("No results returned from backend.")
             st.stop()
+        if not is_active:
+            st.session_state["free_eval_count"] += 1
 
         best = max(results, key=lambda r: r["confidence"])
 
@@ -347,7 +365,4 @@ if st.button("Evaluate"):
                     render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
                 else:
                     st.write("No history yet.")
-
-
-
 

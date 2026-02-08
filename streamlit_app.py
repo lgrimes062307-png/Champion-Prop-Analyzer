@@ -200,7 +200,13 @@ if st.button("Generate Checkout Link"):
     if not discord_user_id:
         st.error("Please enter your Discord User ID.")
     else:
-        checkout = requests.post(SUBSCRIBE_URL, params={"discord_user_id": discord_user_id}).json()
+        resp = requests.post(SUBSCRIBE_URL, params={"discord_user_id": discord_user_id}, timeout=30)
+        try:
+            checkout = resp.json()
+        except Exception:
+            st.error(f"Checkout endpoint returned non-JSON (status {resp.status_code}).")
+            st.code(resp.text)
+            st.stop()
         if "url" in checkout:
             st.success("Checkout link generated.")
             st.write(checkout["url"])
@@ -211,7 +217,13 @@ if st.button("Manage Subscription"):
     if not discord_user_id:
         st.error("Please enter your Discord User ID.")
     else:
-        portal = requests.post(PORTAL_URL, params={"discord_user_id": discord_user_id}).json()
+        resp = requests.post(PORTAL_URL, params={"discord_user_id": discord_user_id}, timeout=30)
+        try:
+            portal = resp.json()
+        except Exception:
+            st.error(f"Portal endpoint returned non-JSON (status {resp.status_code}).")
+            st.code(resp.text)
+            st.stop()
         if "url" in portal:
             st.success("Manage subscription link generated.")
             st.write(portal["url"])
@@ -365,4 +377,3 @@ if st.button("Evaluate"):
                     render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
                 else:
                     st.write("No history yet.")
-

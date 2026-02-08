@@ -43,6 +43,8 @@ BACKEND_URL = st.sidebar.text_input("Backend URL", "http://localhost:8000/analyz
 SUBSCRIBE_URL = st.sidebar.text_input("Subscribe URL Endpoint", "http://localhost:8000/create-checkout-session")
 STATUS_URL = st.sidebar.text_input("Subscription Status Endpoint", "http://localhost:8000/subscription-status")
 PORTAL_URL = st.sidebar.text_input("Manage Subscription Endpoint", "http://localhost:8000/create-portal-session")
+ADMIN_GRANT_URL = st.sidebar.text_input("Admin Grant Endpoint", "http://localhost:8000/grant-access")
+ADMIN_REVOKE_URL = st.sidebar.text_input("Admin Revoke Endpoint", "http://localhost:8000/revoke-access")
 
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
@@ -121,6 +123,41 @@ if st.sidebar.button("Save Preset") and preset_name.strip():
         "conf_low_max": conf_low_max,
     }
     st.session_state["preset"] = preset_name.strip()
+
+st.sidebar.markdown("### Admin Access")
+admin_secret = st.sidebar.text_input("Admin Secret", type="password")
+admin_user_id = st.sidebar.text_input("Discord User ID to grant/revoke")
+col_a, col_b = st.sidebar.columns(2)
+if col_a.button("Grant Access"):
+    if not admin_secret or not admin_user_id:
+        st.sidebar.error("Enter admin secret and user ID.")
+    else:
+        resp = requests.post(ADMIN_GRANT_URL, params={"discord_user_id": admin_user_id, "admin_secret": admin_secret}, timeout=30)
+        try:
+            data = resp.json()
+        except Exception:
+            st.sidebar.error(f"Grant failed (status {resp.status_code}).")
+            st.sidebar.code(resp.text)
+        else:
+            if data.get("ok"):
+                st.sidebar.success(f"Granted access to {admin_user_id}.")
+            else:
+                st.sidebar.error(data.get("detail", "Grant failed."))
+if col_b.button("Revoke Access"):
+    if not admin_secret or not admin_user_id:
+        st.sidebar.error("Enter admin secret and user ID.")
+    else:
+        resp = requests.post(ADMIN_REVOKE_URL, params={"discord_user_id": admin_user_id, "admin_secret": admin_secret}, timeout=30)
+        try:
+            data = resp.json()
+        except Exception:
+            st.sidebar.error(f"Revoke failed (status {resp.status_code}).")
+            st.sidebar.code(resp.text)
+        else:
+            if data.get("ok"):
+                st.sidebar.success(f"Revoked access for {admin_user_id}.")
+            else:
+                st.sidebar.error(data.get("detail", "Revoke failed."))
 
 NBA_TEAMS = [
     "", "ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DAL",
@@ -377,3 +414,4 @@ if st.button("Evaluate"):
                     render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
                 else:
                     st.write("No history yet.")
+

@@ -182,6 +182,8 @@ if "free_eval_date" not in st.session_state:
     st.session_state["free_eval_date"] = ""
 if "free_eval_count" not in st.session_state:
     st.session_state["free_eval_count"] = 0
+if "history" not in st.session_state:
+    st.session_state["history"] = []
 
 query = st.experimental_get_query_params()
 code = query.get("code", [None])[0]

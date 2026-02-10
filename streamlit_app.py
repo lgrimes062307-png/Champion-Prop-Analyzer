@@ -11,6 +11,12 @@ st.set_page_config(layout="wide")
 st.title("NBA Prop Analyzer")
 
 cookie_manager = stx.CookieManager(key="cookie_manager")
+cookie_admin_last = cookie_manager.get("admin_user_id_last")
+cookie_admin_list_raw = cookie_manager.get("admin_user_id_list")
+try:
+    cookie_admin_list = json.loads(cookie_admin_list_raw) if cookie_admin_list_raw else []
+except Exception:
+    cookie_admin_list = []
 
 
 def render_table_html(rows, columns):
@@ -450,9 +456,3 @@ if st.button("Evaluate"):
                     render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
                 else:
                     st.write("No history yet.")
-cookie_admin_last = cookie_manager.get("admin_user_id_last")
-cookie_admin_list_raw = cookie_manager.get("admin_user_id_list")
-try:
-    cookie_admin_list = json.loads(cookie_admin_list_raw) if cookie_admin_list_raw else []
-except Exception:
-    cookie_admin_list = []

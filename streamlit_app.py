@@ -19,6 +19,14 @@ except Exception:
     cookie_admin_list = []
 
 
+def set_cookie_once(name, value):
+    key = f"_cookie_saved_{name}"
+    if st.session_state.get(key) == value:
+        return
+    cookie_manager.set(name, value, key=f"cookie_set_{name}")
+    st.session_state[key] = value
+
+
 def render_table_html(rows, columns):
     if not rows:
         st.write("No data.")
@@ -144,8 +152,8 @@ admin_user_id = st.sidebar.text_input(
 if admin_user_id:
     if admin_user_id not in cookie_admin_list:
         cookie_admin_list.append(admin_user_id)
-    cookie_manager.set("admin_user_id_last", admin_user_id)
-    cookie_manager.set("admin_user_id_list", json.dumps(cookie_admin_list))
+    set_cookie_once("admin_user_id_last", admin_user_id)
+    set_cookie_once("admin_user_id_list", json.dumps(cookie_admin_list))
 col_a, col_b = st.sidebar.columns(2)
 if col_a.button("Grant Access"):
     if not admin_secret or not admin_user_id:
@@ -163,8 +171,8 @@ if col_a.button("Grant Access"):
                 if admin_user_id:
                     if admin_user_id not in cookie_admin_list:
                         cookie_admin_list.append(admin_user_id)
-                    cookie_manager.set("admin_user_id_last", admin_user_id)
-                    cookie_manager.set("admin_user_id_list", json.dumps(cookie_admin_list))
+                    set_cookie_once("admin_user_id_last", admin_user_id)
+                    set_cookie_once("admin_user_id_list", json.dumps(cookie_admin_list))
             else:
                 st.sidebar.error(data.get("detail", "Grant failed."))
 if col_b.button("Revoke Access"):
@@ -183,8 +191,8 @@ if col_b.button("Revoke Access"):
                 if admin_user_id:
                     if admin_user_id not in cookie_admin_list:
                         cookie_admin_list.append(admin_user_id)
-                    cookie_manager.set("admin_user_id_last", admin_user_id)
-                    cookie_manager.set("admin_user_id_list", json.dumps(cookie_admin_list))
+                    set_cookie_once("admin_user_id_last", admin_user_id)
+                    set_cookie_once("admin_user_id_list", json.dumps(cookie_admin_list))
             else:
                 st.sidebar.error(data.get("detail", "Revoke failed."))
 
@@ -241,7 +249,7 @@ if code and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI
         if user_res.status_code == 200:
             st.session_state["discord_user_id"] = user_res.json().get("id", "")
             if st.session_state["discord_user_id"]:
-                cookie_manager.set("discord_user_id", st.session_state["discord_user_id"])
+                set_cookie_once("discord_user_id", st.session_state["discord_user_id"])
     st.experimental_set_query_params()
 
 if DISCORD_CLIENT_ID and DISCORD_REDIRECT_URI:
@@ -254,7 +262,7 @@ else:
 discord_user_id = st.text_input("Discord User ID (for paid access)", st.session_state["discord_user_id"])
 st.session_state["discord_user_id"] = discord_user_id
 if discord_user_id:
-    cookie_manager.set("discord_user_id", discord_user_id)
+    set_cookie_once("discord_user_id", discord_user_id)
 
 if discord_user_id:
     status_res = requests.get(STATUS_URL, params={"discord_user_id": discord_user_id}).json()

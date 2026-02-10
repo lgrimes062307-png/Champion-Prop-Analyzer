@@ -1,11 +1,15 @@
 import streamlit as st
 import requests
+from requests.exceptions import ReadTimeout, RequestException
 import datetime
 import os
 import urllib.parse
+import extra_streamlit_components as stx
 
 st.set_page_config(layout="wide")
 st.title("NBA Prop Analyzer")
+
+cookie_manager = stx.CookieManager(key="cookie_manager")
 
 
 def render_table_html(rows, columns):
@@ -178,6 +182,9 @@ opponent = st.selectbox("Opponent (for H2H & DvP)", NBA_TEAMS)
 st.subheader("Paid Access")
 if "discord_user_id" not in st.session_state:
     st.session_state["discord_user_id"] = ""
+cookie_discord_id = cookie_manager.get("discord_user_id")
+if not st.session_state["discord_user_id"] and cookie_discord_id:
+    st.session_state["discord_user_id"] = cookie_discord_id
 if "free_eval_date" not in st.session_state:
     st.session_state["free_eval_date"] = ""
 if "free_eval_count" not in st.session_state:
@@ -208,6 +215,8 @@ if code and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI
         )
         if user_res.status_code == 200:
             st.session_state["discord_user_id"] = user_res.json().get("id", "")
+            if st.session_state["discord_user_id"]:
+                cookie_manager.set("discord_user_id", st.session_state["discord_user_id"])
     st.experimental_set_query_params()
 
 if DISCORD_CLIENT_ID and DISCORD_REDIRECT_URI:
@@ -219,6 +228,8 @@ else:
 
 discord_user_id = st.text_input("Discord User ID (for paid access)", st.session_state["discord_user_id"])
 st.session_state["discord_user_id"] = discord_user_id
+if discord_user_id:
+    cookie_manager.set("discord_user_id", discord_user_id)
 
 if discord_user_id:
     status_res = requests.get(STATUS_URL, params={"discord_user_id": discord_user_id}).json()
@@ -309,24 +320,33 @@ if st.button("Evaluate"):
         results = []
         for p in compare_props:
             for ln in lines:
-                resp = requests.get(
-                    BACKEND_URL,
-                    params={
-                        "player": player,
-                        "prop": p,
-                        "line": ln,
-                        "opponent": opponent,
-                        "season_type": season_type,
-                        "window_1": window_1,
-                        "window_2": window_2,
-                        "hit_operator": hit_operator,
-                        "conf_l5_min": conf_l5_min,
-                        "conf_l10_min": conf_l10_min,
-                        "conf_h2h_good": conf_h2h_good,
-                        "conf_low_max": conf_low_max,
-                    },
-                    timeout=30,
-                )
+                params = {
+                    "player": player,
+                    "prop": p,
+                    "line": ln,
+                    "opponent": opponent,
+                    "season_type": season_type,
+                    "window_1": window_1,
+                    "window_2": window_2,
+                    "hit_operator": hit_operator,
+                    "conf_l5_min": conf_l5_min,
+                    "conf_l10_min": conf_l10_min,
+                    "conf_h2h_good": conf_h2h_good,
+                    "conf_low_max": conf_low_max,
+                }
+                resp = None
+                for attempt in range(2):
+                    try:
+                        resp = requests.get(BACKEND_URL, params=params, timeout=60)
+                        break
+                    except ReadTimeout:
+                        if attempt == 0:
+                            continue
+                        st.error("Backend timed out twice. Please try again in a moment.")
+                        st.stop()
+                    except RequestException as exc:
+                        st.error(f"Backend request failed: {exc}")
+                        st.stop()
                 try:
                     res = resp.json()
                 except Exception:

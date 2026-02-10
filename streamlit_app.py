@@ -39,10 +39,10 @@ def render_hit_rate_bars(rows):
         )
 
 
-BACKEND_URL = st.sidebar.text_input("Backend URL", "http://localhost:8000/analyze")
-SUBSCRIBE_URL = st.sidebar.text_input("Subscribe URL Endpoint", "http://localhost:8000/create-checkout-session")
-STATUS_URL = st.sidebar.text_input("Subscription Status Endpoint", "http://localhost:8000/subscription-status")
-PORTAL_URL = st.sidebar.text_input("Manage Subscription Endpoint", "http://localhost:8000/create-portal-session")
+BACKEND_URL = "https://champion-prop-analyzer.onrender.com/analyze"
+SUBSCRIBE_URL = "https://champion-prop-analyzer.onrender.com/create-checkout-session"
+STATUS_URL = "https://champion-prop-analyzer.onrender.com/subscription-status"
+PORTAL_URL = "https://champion-prop-analyzer.onrender.com/create-portal-session"
 ADMIN_GRANT_URL = st.sidebar.text_input("Admin Grant Endpoint", "http://localhost:8000/grant-access")
 ADMIN_REVOKE_URL = st.sidebar.text_input("Admin Revoke Endpoint", "http://localhost:8000/revoke-access")
 
@@ -416,4 +416,3 @@ if st.button("Evaluate"):
                     render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
                 else:
                     st.write("No history yet.")
-

@@ -5,6 +5,7 @@ import datetime
 import os
 import urllib.parse
 import extra_streamlit_components as stx
+import json
 
 st.set_page_config(layout="wide")
 st.title("NBA Prop Analyzer")
@@ -130,7 +131,10 @@ if st.sidebar.button("Save Preset") and preset_name.strip():
 
 st.sidebar.markdown("### Admin Access")
 admin_secret = st.sidebar.text_input("Admin Secret", type="password")
-admin_user_id = st.sidebar.text_input("Discord User ID to grant/revoke")
+admin_user_id = st.sidebar.text_input(
+    "Discord User ID to grant/revoke",
+    value=cookie_admin_last or "",
+)
 col_a, col_b = st.sidebar.columns(2)
 if col_a.button("Grant Access"):
     if not admin_secret or not admin_user_id:
@@ -145,6 +149,11 @@ if col_a.button("Grant Access"):
         else:
             if data.get("ok"):
                 st.sidebar.success(f"Granted access to {admin_user_id}.")
+                if admin_user_id:
+                    if admin_user_id not in cookie_admin_list:
+                        cookie_admin_list.append(admin_user_id)
+                    cookie_manager.set("admin_user_id_last", admin_user_id)
+                    cookie_manager.set("admin_user_id_list", json.dumps(cookie_admin_list))
             else:
                 st.sidebar.error(data.get("detail", "Grant failed."))
 if col_b.button("Revoke Access"):
@@ -160,6 +169,11 @@ if col_b.button("Revoke Access"):
         else:
             if data.get("ok"):
                 st.sidebar.success(f"Revoked access for {admin_user_id}.")
+                if admin_user_id:
+                    if admin_user_id not in cookie_admin_list:
+                        cookie_admin_list.append(admin_user_id)
+                    cookie_manager.set("admin_user_id_last", admin_user_id)
+                    cookie_manager.set("admin_user_id_list", json.dumps(cookie_admin_list))
             else:
                 st.sidebar.error(data.get("detail", "Revoke failed."))
 
@@ -436,3 +450,9 @@ if st.button("Evaluate"):
                     render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
                 else:
                     st.write("No history yet.")
+cookie_admin_last = cookie_manager.get("admin_user_id_last")
+cookie_admin_list_raw = cookie_manager.get("admin_user_id_list")
+try:
+    cookie_admin_list = json.loads(cookie_admin_list_raw) if cookie_admin_list_raw else []
+except Exception:
+    cookie_admin_list = []

@@ -54,8 +54,8 @@ BACKEND_URL = "https://champion-prop-analyzer.onrender.com/analyze"
 SUBSCRIBE_URL = "https://champion-prop-analyzer.onrender.com/create-checkout-session"
 STATUS_URL = "https://champion-prop-analyzer.onrender.com/subscription-status"
 PORTAL_URL = "https://champion-prop-analyzer.onrender.com/create-portal-session"
-ADMIN_GRANT_URL = st.sidebar.text_input("Admin Grant Endpoint", "http://localhost:8000/grant-access")
-ADMIN_REVOKE_URL = st.sidebar.text_input("Admin Revoke Endpoint", "http://localhost:8000/revoke-access")
+ADMIN_GRANT_URL = "https://champion-prop-analyzer.onrender.com/grant-access"
+ADMIN_REVOKE_URL = "https://champion-prop-analyzer.onrender.com/revoke-access"
 
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
@@ -141,6 +141,11 @@ admin_user_id = st.sidebar.text_input(
     "Discord User ID to grant/revoke",
     value=cookie_admin_last or "",
 )
+if admin_user_id:
+    if admin_user_id not in cookie_admin_list:
+        cookie_admin_list.append(admin_user_id)
+    cookie_manager.set("admin_user_id_last", admin_user_id)
+    cookie_manager.set("admin_user_id_list", json.dumps(cookie_admin_list))
 col_a, col_b = st.sidebar.columns(2)
 if col_a.button("Grant Access"):
     if not admin_secret or not admin_user_id:

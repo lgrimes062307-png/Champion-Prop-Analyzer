@@ -218,10 +218,6 @@ if "discord_user_id" not in st.session_state:
 cookie_discord_id = cookie_manager.get("discord_user_id")
 if not st.session_state["discord_user_id"] and cookie_discord_id:
     st.session_state["discord_user_id"] = cookie_discord_id
-if "free_eval_date" not in st.session_state:
-    st.session_state["free_eval_date"] = ""
-if "free_eval_count" not in st.session_state:
-    st.session_state["free_eval_count"] = 0
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
@@ -272,12 +268,7 @@ else:
     is_active = False
 
 if not is_active:
-    today = datetime.date.today().isoformat()
-    if st.session_state["free_eval_date"] != today:
-        st.session_state["free_eval_date"] = today
-        st.session_state["free_eval_count"] = 0
-    remaining = max(0, 1 - st.session_state["free_eval_count"])
-    st.info(f"Free preview: {remaining} evaluation left today. Upgrade to unlock full analysis, comparisons, top picks, and history.")
+    st.info("Upgrade to unlock full analysis, comparisons, top picks, and history.")
 
 if st.button("Generate Checkout Link"):
     if not discord_user_id:
@@ -328,15 +319,8 @@ else:
 if st.button("Evaluate"):
     with st.spinner("Running analysis..."):
         if not is_active:
-            today = datetime.date.today().isoformat()
-            if st.session_state["free_eval_date"] != today:
-                st.session_state["free_eval_date"] = today
-                st.session_state["free_eval_count"] = 0
-            if st.session_state["free_eval_count"] >= 1:
-                st.error("Free limit reached for today. Please upgrade to continue.")
-                st.stop()
-            compare_props = [prop]
-            compare_lines_raw = str(line)
+            st.error("Please upgrade to continue.")
+            st.stop()
 
         lines = []
         for part in compare_lines_raw.split(","):
@@ -396,9 +380,6 @@ if st.button("Evaluate"):
         if not results:
             st.error("No results returned from backend.")
             st.stop()
-        if not is_active:
-            st.session_state["free_eval_count"] += 1
-
         best = max(results, key=lambda r: r["confidence"])
 
         st.subheader(f"Recommendation: {best['recommendation']}")

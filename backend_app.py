@@ -276,3 +276,4 @@ def revoke_access(discord_user_id: str = Query(...), admin_secret: str = Query(.
     set_subscription(discord_user_id, "canceled", "manual")
     set_discord_role(discord_user_id, False)
     return {"ok": True}
+

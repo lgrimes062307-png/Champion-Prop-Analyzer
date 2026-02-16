@@ -8,7 +8,7 @@ import extra_streamlit_components as stx
 import json
 
 st.set_page_config(layout="wide")
-st.title("NBA Prop Analyzer")
+st.title("Multi-Sport Prop Analyzer")
 
 cookie_manager = stx.CookieManager(key="cookie_manager")
 cookie_admin_last = cookie_manager.get("admin_user_id_last")
@@ -121,6 +121,8 @@ hit_operator = st.sidebar.selectbox(
     index=["gt", "gte"].index(st.session_state["hit_operator"]),
     key="hit_operator",
 )
+offered_odds_input = st.sidebar.text_input("Offered Odds (American)", value="")
+include_injury = st.sidebar.checkbox("Include injury context", value=False)
 
 st.sidebar.markdown("### Model Tuning")
 conf_l5_min = st.sidebar.slider("Conf L5 Min", 0, 100, st.session_state["conf_l5_min"], key="conf_l5_min")
@@ -204,13 +206,31 @@ NBA_TEAMS = [
     "UTA", "WAS",
 ]
 
+SPORT_OPTIONS = ["nba", "mlb", "nfl", "soccer", "nhl"]
+PROP_OPTIONS_BY_SPORT = {
+    "nba": ["points", "rebounds", "assists", "points+assists", "points+rebounds", "rebounds+assists", "pra"],
+    "mlb": ["hits", "runs", "rbis", "home_runs", "total_bases", "strikeouts"],
+    "nfl": ["passing_yards", "rushing_yards", "receiving_yards", "receptions", "touchdowns"],
+    "soccer": ["goals", "assists", "shots", "shots_on_target", "passes"],
+    "nhl": ["goals", "assists", "points", "shots", "saves"],
+}
+OPPONENTS_BY_SPORT = {
+    "nba": NBA_TEAMS,
+    "mlb": ["", "ARI", "ATL", "BAL", "BOS", "CHC", "CIN", "CLE", "COL", "CWS", "DET", "HOU", "KC", "LAA", "LAD", "MIA", "MIL", "MIN", "NYM", "NYY", "OAK", "PHI", "PIT", "SD", "SEA", "SF", "STL", "TB", "TEX", "TOR", "WSH"],
+    "nfl": ["", "ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE", "DAL", "DEN", "DET", "GB", "HOU", "IND", "JAX", "KC", "LAC", "LAR", "LV", "MIA", "MIN", "NE", "NO", "NYG", "NYJ", "PHI", "PIT", "SEA", "SF", "TB", "TEN", "WAS"],
+    "soccer": ["", "ARS", "AVL", "BAR", "BAY", "CHE", "DOR", "INT", "JUV", "LIV", "MCI", "MUN", "NEW", "PSG", "RMA", "ROM", "TOT"],
+    "nhl": ["", "ANA", "BOS", "BUF", "CAR", "CBJ", "CGY", "CHI", "COL", "DAL", "DET", "EDM", "FLA", "LAK", "MIN", "MTL", "NJD", "NSH", "NYI", "NYR", "OTT", "PHI", "PIT", "SEA", "SJS", "STL", "TBL", "TOR", "UTA", "VAN", "VGK", "WPG", "WSH"],
+}
+
+sport = st.selectbox("Sport", SPORT_OPTIONS, index=0).lower()
+available_props = PROP_OPTIONS_BY_SPORT[sport]
 player = st.text_input("Player Name", "LeBron James")
 prop = st.selectbox(
     "Prop Type",
-    ["points", "rebounds", "assists", "points+assists", "points+rebounds", "rebounds+assists", "pra"],
+    available_props,
 )
 line = st.number_input("Prop Line", value=25.5)
-opponent = st.selectbox("Opponent (for H2H & DvP)", NBA_TEAMS)
+opponent = st.selectbox("Opponent (for H2H & DvP)", OPPONENTS_BY_SPORT[sport])
 
 st.subheader("Paid Access")
 if "discord_user_id" not in st.session_state:
@@ -308,7 +328,7 @@ compare_mode = st.checkbox("Compare multiple props/lines", value=False, disabled
 if compare_mode:
     compare_props = st.multiselect(
         "Props to compare",
-        ["points", "rebounds", "assists", "points+assists", "points+rebounds", "rebounds+assists", "pra"],
+        available_props,
         default=[prop],
     )
     compare_lines_raw = st.text_input("Lines to compare (comma separated)", "20.5, 25.5")
@@ -339,6 +359,7 @@ if st.button("Evaluate"):
             for ln in lines:
                 params = {
                     "player": player,
+                    "sport": sport,
                     "prop": p,
                     "line": ln,
                     "opponent": opponent,
@@ -350,7 +371,14 @@ if st.button("Evaluate"):
                     "conf_l10_min": conf_l10_min,
                     "conf_h2h_good": conf_h2h_good,
                     "conf_low_max": conf_low_max,
+                    "include_injury": str(include_injury).lower(),
                 }
+                if offered_odds_input.strip():
+                    try:
+                        params["offered_odds"] = int(offered_odds_input.strip())
+                    except ValueError:
+                        st.error("Offered Odds must be an integer like -110 or 120.")
+                        st.stop()
                 resp = None
                 for attempt in range(2):
                     try:
@@ -385,7 +413,7 @@ if st.button("Evaluate"):
         st.subheader(f"Recommendation: {best['recommendation']}")
         opp_label = f" vs {opponent}" if opponent else ""
         st.write(
-            f"Best pick: {best['player']} {best['prop']} at line {best['line']}{opp_label} "
+            f"Best pick ({best.get('sport', sport).upper()}): {best['player']} {best['prop']} at line {best['line']}{opp_label} "
             f"with {best['confidence']}% confidence."
         )
 
@@ -396,8 +424,19 @@ if st.button("Evaluate"):
 
         c4, c5, c6 = st.columns(3)
         c4.metric("H2H Hit Rate", f"{best['h2h_hit_rate']}%")
-        c5.metric("Minutes Projection", f"{best['minutes_proj']} min")
+        c5.metric(best.get("projection_label", "Minutes Projection"), f"{best['minutes_proj']}")
         c6.metric("Defense vs Position", best["dvp"])
+
+        c7, c8, c9 = st.columns(3)
+        c7.metric("Projected Prob", f"{best.get('projected_probability', 0)}%")
+        c8.metric("Edge", f"{best.get('edge_pct', 'n/a')}%")
+        c9.metric("Data Source", best.get("data_source", "unknown"))
+
+        if best.get("fallback_used"):
+            st.warning("Fallback model used because live provider data was unavailable.")
+        injury_ctx = best.get("injury_context", {})
+        if injury_ctx and injury_ctx.get("status") != "not_requested":
+            st.info(f"Injury context: {injury_ctx.get('status')} - {injury_ctx.get('detail', '')}")
 
         st.progress(best["confidence"] / 100)
 

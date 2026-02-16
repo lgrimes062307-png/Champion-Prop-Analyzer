@@ -1,0 +1,99 @@
+import pandas as pd
+
+import backend_app as app
+
+
+def make_df():
+    return pd.DataFrame(
+        [
+            {"PTS": 20, "REB": 5, "AST": 7, "MATCHUP": "LAL vs BOS", "MIN": 34},
+            {"PTS": 28, "REB": 8, "AST": 10, "MATCHUP": "LAL @ BOS", "MIN": 36},
+            {"PTS": 15, "REB": 11, "AST": 4, "MATCHUP": "LAL vs NYK", "MIN": 30},
+        ]
+    )
+
+
+def test_stat_value_aliases():
+    df = make_df()
+    row = df.iloc[0]
+    assert app.stat_value("points", row) == 20
+    assert app.stat_value("rebounds", row) == 5
+    assert app.stat_value("assists", row) == 7
+    assert app.stat_value("pts+reb", row) == 25
+    assert app.stat_value("pts+ast", row) == 27
+    assert app.stat_value("reb+ast", row) == 12
+    assert app.stat_value("pts+reb+ast", row) == 32
+
+
+def test_hit_rate_details_and_ci():
+    df = make_df()
+    hits, n, rate = app.hit_rate_details(df, "points", 18, "gt")
+    assert n == 3
+    assert hits == 2
+    assert rate == round((2 / 3) * 100, 2)
+    low, high = app.wilson_interval(hits, n)
+    assert 0 <= low <= high <= 100
+
+
+def test_avg_stat():
+    df = make_df()
+    avg = app.avg_stat(df, "rebounds")
+    assert avg == round((5 + 8 + 11) / 3, 2)
+
+
+def test_confidence():
+    conf = app.confidence(55, 60, 50, 50, 50, 60, 40)
+    assert conf in {70, 80, 90, 50}
+
+
+def test_sport_and_prop_normalization():
+    assert app.normalize_sport("basketball") == "nba"
+    assert app.normalize_sport("hockey") == "nhl"
+    assert app.normalize_prop("pts", "nba") == "points"
+    assert app.normalize_prop("hr", "mlb") == "home_runs"
+    assert app.normalize_prop("rec_yds", "nfl") == "receiving_yards"
+
+
+def test_multi_sport_fallback_shape():
+    res = app.build_multi_sport_fallback(
+        sport="nfl",
+        player="Patrick Mahomes",
+        prop="passing_yards",
+        line=275.5,
+        opponent="BAL",
+        window_1=5,
+        window_2=10,
+        conf_l5_min=50,
+        conf_l10_min=50,
+        conf_h2h_good=60,
+        conf_low_max=40,
+    )
+    assert res["sport"] == "nfl"
+    assert res["prop"] == "passing_yards"
+    assert "recommendation" in res
+    assert "confidence" in res
+    assert "projection_label" in res
+
+
+def test_numeric_parsers():
+    assert app._extract_first_number("12-8") == 12.0
+    assert app._extract_first_number("7.5 attempts") == 7.5
+    assert app._numeric("19") == 19.0
+    assert app._numeric(4) == 4.0
+    assert app._numeric("N/A") is None
+
+
+def test_collect_metric_series():
+    rows = [
+        {"passingYards": "310", "opponent": "BAL"},
+        {"passing_yards": 280, "opponent": "KC"},
+        {"other": 1},
+    ]
+    vals = app._collect_metric_series(rows, ["passingYards", "passing_yards"])
+    assert vals == [310.0, 280.0]
+
+
+def test_implied_probability_from_american():
+    assert app.implied_probability_from_american(-110) == 52.38
+    assert app.implied_probability_from_american(120) == 45.45
+

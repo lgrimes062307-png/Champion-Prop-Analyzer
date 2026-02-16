@@ -58,12 +58,13 @@ def render_hit_rate_bars(rows):
         )
 
 
-BACKEND_URL = "https://champion-prop-analyzer.onrender.com/analyze"
-SUBSCRIBE_URL = "https://champion-prop-analyzer.onrender.com/create-checkout-session"
-STATUS_URL = "https://champion-prop-analyzer.onrender.com/subscription-status"
-PORTAL_URL = "https://champion-prop-analyzer.onrender.com/create-portal-session"
-ADMIN_GRANT_URL = "https://champion-prop-analyzer.onrender.com/grant-access"
-ADMIN_REVOKE_URL = "https://champion-prop-analyzer.onrender.com/revoke-access"
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "https://champion-prop-analyzer.onrender.com").rstrip("/")
+BACKEND_URL = os.getenv("BACKEND_ANALYZE_URL", f"{BACKEND_BASE_URL}/analyze")
+SUBSCRIBE_URL = os.getenv("BACKEND_SUBSCRIBE_URL", f"{BACKEND_BASE_URL}/create-checkout-session")
+STATUS_URL = os.getenv("BACKEND_STATUS_URL", f"{BACKEND_BASE_URL}/subscription-status")
+PORTAL_URL = os.getenv("BACKEND_PORTAL_URL", f"{BACKEND_BASE_URL}/create-portal-session")
+ADMIN_GRANT_URL = os.getenv("BACKEND_ADMIN_GRANT_URL", f"{BACKEND_BASE_URL}/grant-access")
+ADMIN_REVOKE_URL = os.getenv("BACKEND_ADMIN_REVOKE_URL", f"{BACKEND_BASE_URL}/revoke-access")
 
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")

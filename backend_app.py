@@ -4,13 +4,11 @@ from nba_api.stats.endpoints import leaguedashteamstats, playergamelog
 from nba_api.stats.static import players, teams
 import datetime
 import hashlib
-import json
 import os
 import random
 import time
 import threading
 import sqlite3
-import stripe
 import requests
 from typing import Dict, List, Optional, Tuple
 
@@ -47,18 +45,7 @@ RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "60"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 DB_PATH = os.getenv("DB_PATH", "app.db")
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "")
-STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL", "https://example.com/success")
-STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL", "https://example.com/cancel")
-STRIPE_PORTAL_RETURN_URL = os.getenv("STRIPE_PORTAL_RETURN_URL", "https://example.com/account")
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "")
-DISCORD_ROLE_ID = os.getenv("DISCORD_ROLE_ID", "")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-
-stripe.api_key = STRIPE_SECRET_KEY
 
 SUPPORTED_SPORTS = ("nba", "mlb", "nfl", "soccer", "nhl")
 SPORT_ALIASES = {
@@ -183,9 +170,6 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_BASE_URL = os.getenv("ODDS_API_BASE_URL", "https://api.the-odds-api.com/v4")
 ALERT_DISCORD_WEBHOOK_URL = os.getenv("ALERT_DISCORD_WEBHOOK_URL", "")
 ALERT_MIN_EDGE_PCT = float(os.getenv("ALERT_MIN_EDGE_PCT", "3.5"))
-RATE_LIMIT_MAX_FREE = int(os.getenv("RATE_LIMIT_MAX_FREE", "40"))
-RATE_LIMIT_MAX_PRO = int(os.getenv("RATE_LIMIT_MAX_PRO", "200"))
-API_KEYS_JSON = os.getenv("API_KEYS_JSON", "{}")
 
 ESPN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; prop-analyzer/1.0)",
@@ -195,10 +179,6 @@ _provider_state: Dict[str, dict] = {}
 _provider_lock = threading.Lock()
 _provider_fail_threshold = int(os.getenv("PROVIDER_FAIL_THRESHOLD", "4"))
 _provider_cooldown_seconds = int(os.getenv("PROVIDER_COOLDOWN_SECONDS", "120"))
-try:
-    API_KEY_TIERS = json.loads(API_KEYS_JSON) if API_KEYS_JSON else {}
-except Exception:
-    API_KEY_TIERS = {}
 
 
 def init_db():
@@ -241,21 +221,9 @@ def init_db():
     )
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS api_keys (
-            api_key TEXT PRIMARY KEY,
-            tier TEXT,
-            enabled INTEGER,
-            created_at TEXT
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            discord_user_id TEXT PRIMARY KEY,
-            stripe_customer_id TEXT,
-            status TEXT,
-            updated_at TEXT
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
         """
     )
@@ -263,85 +231,9 @@ def init_db():
     conn.close()
 
 
-def upsert_subscription(discord_user_id: str, customer_id: str, status: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO subscriptions (discord_user_id, stripe_customer_id, status, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(discord_user_id) DO UPDATE SET
-            stripe_customer_id=excluded.stripe_customer_id,
-            status=excluded.status,
-            updated_at=excluded.updated_at
-        """,
-        (discord_user_id, customer_id, status, datetime.datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def update_status_by_customer(customer_id: str, status: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE subscriptions
-        SET status=?, updated_at=?
-        WHERE stripe_customer_id=?
-        """,
-        (status, datetime.datetime.utcnow().isoformat(), customer_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_subscription_status(discord_user_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT status FROM subscriptions WHERE discord_user_id=?",
-        (discord_user_id,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else "none"
-
-
-def get_customer_id(discord_user_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT stripe_customer_id FROM subscriptions WHERE discord_user_id=?",
-        (discord_user_id,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else ""
-
-
-def list_subscriptions():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT discord_user_id, status FROM subscriptions")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def grant_manual_access(discord_user_id: str, status: str = "active"):
-    # Use a placeholder customer id for manual grants
-    upsert_subscription(discord_user_id, "manual", status)
-    return True
-
-
-def _rate_limit_ok(ip: str):
-    return _rate_limit_for_identity(ip, "free")
-
-
-def _rate_limit_for_identity(identity: str, tier: str):
+def _rate_limit_for_identity(identity: str):
     now = time.time()
-    max_hits = RATE_LIMIT_MAX_PRO if tier == "pro" else RATE_LIMIT_MAX_FREE if tier == "free" else RATE_LIMIT_MAX
+    max_hits = RATE_LIMIT_MAX
     with _rate_lock:
         hits = _rate_store.get(identity, [])
         hits = [t for t in hits if now - t < RATE_LIMIT_WINDOW_SECONDS]
@@ -355,24 +247,6 @@ def _rate_limit_for_identity(identity: str, tier: str):
 
 def _now_iso():
     return datetime.datetime.utcnow().isoformat()
-
-
-def _get_api_key_tier(request: Request):
-    api_key = request.headers.get("x-api-key", "").strip()
-    if not api_key:
-        api_key = request.query_params.get("api_key", "").strip()
-    if not api_key:
-        return "", "free"
-    tier = API_KEY_TIERS.get(api_key)
-    if tier:
-        return api_key, tier
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT tier FROM api_keys WHERE api_key = ? AND enabled = 1", (api_key,))
-    row = cur.fetchone()
-    conn.close()
-    tier = row[0] if row else "free"
-    return api_key, tier
 
 
 def _provider_name_from_url(url: str):
@@ -1292,21 +1166,6 @@ def build_reasons(prop: str, line: float, l5: float, l10: float, h2h: float, avg
     return reasons
 
 
-def assign_discord_role(discord_user_id: str, add: bool):
-    if not (DISCORD_BOT_TOKEN and DISCORD_GUILD_ID and DISCORD_ROLE_ID):
-        return False
-    headers = {
-        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    url = f"https://discord.com/api/v10/guilds/{DISCORD_GUILD_ID}/members/{discord_user_id}/roles/{DISCORD_ROLE_ID}"
-    if add:
-        resp = requests.put(url, headers=headers, json={})
-    else:
-        resp = requests.delete(url, headers=headers)
-    return resp.status_code in (200, 201, 204)
-
-
 init_db()
 
 
@@ -1341,9 +1200,8 @@ def evaluate(
         )
 
     client_ip = request.client.host if request.client else "unknown"
-    api_key, tier = _get_api_key_tier(request)
-    identity = f"{client_ip}|{api_key or 'anon'}"
-    ok, retry_after = _rate_limit_for_identity(identity, tier)
+    identity = f"{client_ip}|anon"
+    ok, retry_after = _rate_limit_for_identity(identity)
     if not ok:
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Try again in {retry_after}s.")
 
@@ -1408,7 +1266,6 @@ def evaluate(
         result["offered_odds"] = offered_odds
         result["implied_probability"] = implied_prob
         result["edge_pct"] = edge_pct
-        result["api_tier"] = tier
         result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
         if edge_pct is not None and edge_pct >= ALERT_MIN_EDGE_PCT and result.get("confidence", 0) >= 80:
             _send_discord_alert(
@@ -1521,7 +1378,6 @@ def evaluate(
     result["offered_odds"] = offered_odds
     result["implied_probability"] = implied_prob
     result["edge_pct"] = edge_pct
-    result["api_tier"] = tier
     result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
     if edge_pct is not None and edge_pct >= ALERT_MIN_EDGE_PCT and result.get("confidence", 0) >= 80:
         _send_discord_alert(
@@ -1613,9 +1469,8 @@ def odds_edge(
         raise HTTPException(status_code=400, detail="Unsupported sport")
     if not ODDS_API_KEY:
         raise HTTPException(status_code=400, detail="ODDS_API_KEY not configured")
-    api_key, tier = _get_api_key_tier(request)
-    identity = f"odds|{request.client.host if request.client else 'unknown'}|{api_key or 'anon'}"
-    ok, retry_after = _rate_limit_for_identity(identity, tier)
+    identity = f"odds|{request.client.host if request.client else 'unknown'}|anon"
+    ok, retry_after = _rate_limit_for_identity(identity)
     if not ok:
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Try again in {retry_after}s.")
     sport_key = _odds_sport_key(normalized_sport)
@@ -1767,26 +1622,6 @@ def picks(
     return {"count": len(items), "items": items}
 
 
-@app.post("/create-api-key")
-def create_api_key(
-    tier: str = Query("pro"),
-    admin_secret: str = Query(..., min_length=1),
-):
-    if not ADMIN_SECRET or admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized.")
-    normalized_tier = "pro" if tier.lower() == "pro" else "free"
-    raw = f"{time.time()}|{random.random()}|{normalized_tier}"
-    api_key = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT INTO api_keys (api_key, tier, enabled, created_at) VALUES (?, ?, 1, ?)",
-        (api_key, normalized_tier, _now_iso()),
-    )
-    conn.commit()
-    conn.close()
-    return {"api_key": api_key, "tier": normalized_tier}
-
-
 @app.post("/settle-pick")
 def settle_pick(
     pick_id: int = Query(..., ge=1),
@@ -1836,100 +1671,3 @@ def settle_pick(
     conn.commit()
     conn.close()
     return {"ok": True, "pick_id": pick_id, "result": result, "pnl_units": pnl}
-
-
-@app.post("/create-checkout-session")
-def create_checkout_session(discord_user_id: str = Query(..., min_length=1)):
-    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
-        return {"error": "Stripe is not configured."}
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=STRIPE_SUCCESS_URL,
-        cancel_url=STRIPE_CANCEL_URL,
-        metadata={"discord_user_id": discord_user_id},
-    )
-    return {"url": session.url}
-
-
-@app.get("/subscription-status")
-def subscription_status(discord_user_id: str = Query(..., min_length=1)):
-    status = get_subscription_status(discord_user_id)
-    active = status in ("active", "trialing")
-    return {"status": status, "active": active}
-
-
-@app.post("/create-portal-session")
-def create_portal_session(discord_user_id: str = Query(..., min_length=1)):
-    if not STRIPE_SECRET_KEY:
-        return {"error": "Stripe is not configured."}
-    customer_id = get_customer_id(discord_user_id)
-    if not customer_id:
-        return {"error": "No customer found for this user."}
-    session = stripe.billing_portal.Session.create(
-        customer=customer_id,
-        return_url=STRIPE_PORTAL_RETURN_URL,
-    )
-    return {"url": session.url}
-
-
-@app.post("/stripe-webhook")
-async def stripe_webhook(request: Request):
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="Stripe webhook secret not configured.")
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    event_type = event["type"]
-    data_object = event["data"]["object"]
-
-    if event_type == "checkout.session.completed":
-        discord_user_id = data_object.get("metadata", {}).get("discord_user_id", "")
-        customer_id = data_object.get("customer", "")
-        if discord_user_id:
-            upsert_subscription(discord_user_id, customer_id, "active")
-            assign_discord_role(discord_user_id, True)
-
-    if event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
-        customer_id = data_object.get("customer", "")
-        status = data_object.get("status", "canceled")
-        if customer_id:
-            update_status_by_customer(customer_id, status)
-
-    return {"received": True}
-
-
-@app.post("/sync-roles")
-def sync_roles(admin_secret: str = Query(..., min_length=1)):
-    if not ADMIN_SECRET or admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized.")
-    updated = 0
-    rows = list_subscriptions()
-    for discord_user_id, status in rows:
-        is_active = status in ("active", "trialing")
-        ok = assign_discord_role(discord_user_id, is_active)
-        if ok:
-            updated += 1
-    return {"updated": updated, "total": len(rows)}
-
-
-@app.post("/grant-access")
-def grant_access(discord_user_id: str = Query(..., min_length=1), admin_secret: str = Query(..., min_length=1)):
-    if not ADMIN_SECRET or admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized.")
-    grant_manual_access(discord_user_id, "active")
-    assign_discord_role(discord_user_id, True)
-    return {"ok": True, "discord_user_id": discord_user_id, "status": "active"}
-
-
-@app.post("/revoke-access")
-def revoke_access(discord_user_id: str = Query(..., min_length=1), admin_secret: str = Query(..., min_length=1)):
-    if not ADMIN_SECRET or admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized.")
-    grant_manual_access(discord_user_id, "canceled")
-    assign_discord_role(discord_user_id, False)
-    return {"ok": True, "discord_user_id": discord_user_id, "status": "canceled"}

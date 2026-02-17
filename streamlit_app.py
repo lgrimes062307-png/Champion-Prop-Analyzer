@@ -1,31 +1,10 @@
 import streamlit as st
 import requests
 from requests.exceptions import ReadTimeout, RequestException
-import datetime
 import os
-import urllib.parse
-import extra_streamlit_components as stx
-import json
 
 st.set_page_config(layout="wide")
 st.title("Multi-Sport Prop Analyzer")
-
-cookie_manager = stx.CookieManager(key="cookie_manager")
-cookie_admin_last = cookie_manager.get("admin_user_id_last")
-cookie_admin_list_raw = cookie_manager.get("admin_user_id_list")
-try:
-    cookie_admin_list = json.loads(cookie_admin_list_raw) if cookie_admin_list_raw else []
-except Exception:
-    cookie_admin_list = []
-
-
-def set_cookie_once(name, value):
-    key = f"_cookie_saved_{name}"
-    if st.session_state.get(key) == value:
-        return
-    cookie_manager.set(name, value, key=f"cookie_set_{name}")
-    st.session_state[key] = value
-
 
 def render_table_html(rows, columns):
     if not rows:
@@ -60,15 +39,6 @@ def render_hit_rate_bars(rows):
 
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "https://champion-prop-analyzer.onrender.com").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_ANALYZE_URL", f"{BACKEND_BASE_URL}/analyze")
-SUBSCRIBE_URL = os.getenv("BACKEND_SUBSCRIBE_URL", f"{BACKEND_BASE_URL}/create-checkout-session")
-STATUS_URL = os.getenv("BACKEND_STATUS_URL", f"{BACKEND_BASE_URL}/subscription-status")
-PORTAL_URL = os.getenv("BACKEND_PORTAL_URL", f"{BACKEND_BASE_URL}/create-portal-session")
-ADMIN_GRANT_URL = os.getenv("BACKEND_ADMIN_GRANT_URL", f"{BACKEND_BASE_URL}/grant-access")
-ADMIN_REVOKE_URL = os.getenv("BACKEND_ADMIN_REVOKE_URL", f"{BACKEND_BASE_URL}/revoke-access")
-
-DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
-DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
-DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", "")
 
 DEFAULT_PRESETS = {
     "Default": {"season_type": "Regular Season", "window_1": 5, "window_2": 10, "hit_operator": "gt",
@@ -146,59 +116,6 @@ if st.sidebar.button("Save Preset") and preset_name.strip():
     }
     st.session_state["preset"] = preset_name.strip()
 
-st.sidebar.markdown("### Admin Access")
-admin_secret = st.sidebar.text_input("Admin Secret", type="password")
-admin_user_id = st.sidebar.text_input(
-    "Discord User ID to grant/revoke",
-    value=cookie_admin_last or "",
-)
-if admin_user_id:
-    if admin_user_id not in cookie_admin_list:
-        cookie_admin_list.append(admin_user_id)
-    set_cookie_once("admin_user_id_last", admin_user_id)
-    set_cookie_once("admin_user_id_list", json.dumps(cookie_admin_list))
-col_a, col_b = st.sidebar.columns(2)
-if col_a.button("Grant Access"):
-    if not admin_secret or not admin_user_id:
-        st.sidebar.error("Enter admin secret and user ID.")
-    else:
-        resp = requests.post(ADMIN_GRANT_URL, params={"discord_user_id": admin_user_id, "admin_secret": admin_secret}, timeout=30)
-        try:
-            data = resp.json()
-        except Exception:
-            st.sidebar.error(f"Grant failed (status {resp.status_code}).")
-            st.sidebar.code(resp.text)
-        else:
-            if data.get("ok"):
-                st.sidebar.success(f"Granted access to {admin_user_id}.")
-                if admin_user_id:
-                    if admin_user_id not in cookie_admin_list:
-                        cookie_admin_list.append(admin_user_id)
-                    set_cookie_once("admin_user_id_last", admin_user_id)
-                    set_cookie_once("admin_user_id_list", json.dumps(cookie_admin_list))
-            else:
-                st.sidebar.error(data.get("detail", "Grant failed."))
-if col_b.button("Revoke Access"):
-    if not admin_secret or not admin_user_id:
-        st.sidebar.error("Enter admin secret and user ID.")
-    else:
-        resp = requests.post(ADMIN_REVOKE_URL, params={"discord_user_id": admin_user_id, "admin_secret": admin_secret}, timeout=30)
-        try:
-            data = resp.json()
-        except Exception:
-            st.sidebar.error(f"Revoke failed (status {resp.status_code}).")
-            st.sidebar.code(resp.text)
-        else:
-            if data.get("ok"):
-                st.sidebar.success(f"Revoked access for {admin_user_id}.")
-                if admin_user_id:
-                    if admin_user_id not in cookie_admin_list:
-                        cookie_admin_list.append(admin_user_id)
-                    set_cookie_once("admin_user_id_last", admin_user_id)
-                    set_cookie_once("admin_user_id_list", json.dumps(cookie_admin_list))
-            else:
-                st.sidebar.error(data.get("detail", "Revoke failed."))
-
 NBA_TEAMS = [
     "", "ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DAL",
     "DEN", "DET", "GSW", "HOU", "IND", "LAC", "LAL",
@@ -233,99 +150,9 @@ prop = st.selectbox(
 line = st.number_input("Prop Line", value=25.5)
 opponent = st.selectbox("Opponent (for H2H & DvP)", OPPONENTS_BY_SPORT[sport])
 
-st.subheader("Paid Access")
-if "discord_user_id" not in st.session_state:
-    st.session_state["discord_user_id"] = ""
-cookie_discord_id = cookie_manager.get("discord_user_id")
-if not st.session_state["discord_user_id"] and cookie_discord_id:
-    st.session_state["discord_user_id"] = cookie_discord_id
 if "history" not in st.session_state:
     st.session_state["history"] = []
-
-query = st.experimental_get_query_params()
-code = query.get("code", [None])[0]
-if code and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_REDIRECT_URI:
-    token_res = requests.post(
-        "https://discord.com/api/oauth2/token",
-        data={
-            "client_id": DISCORD_CLIENT_ID,
-            "client_secret": DISCORD_CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": DISCORD_REDIRECT_URI,
-            "scope": "identify",
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    if token_res.status_code == 200:
-        token = token_res.json().get("access_token", "")
-        user_res = requests.get(
-            "https://discord.com/api/users/@me",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if user_res.status_code == 200:
-            st.session_state["discord_user_id"] = user_res.json().get("id", "")
-            if st.session_state["discord_user_id"]:
-                set_cookie_once("discord_user_id", st.session_state["discord_user_id"])
-    st.experimental_set_query_params()
-
-if DISCORD_CLIENT_ID and DISCORD_REDIRECT_URI:
-    params = {"client_id": DISCORD_CLIENT_ID, "redirect_uri": DISCORD_REDIRECT_URI, "response_type": "code", "scope": "identify"}
-    auth_url = "https://discord.com/api/oauth2/authorize?" + urllib.parse.urlencode(params)
-    st.markdown(f"[Connect Discord]({auth_url})")
-else:
-    st.caption("Set DISCORD_CLIENT_ID and DISCORD_REDIRECT_URI to enable one-click Discord connect.")
-
-discord_user_id = st.text_input("Discord User ID (for paid access)", st.session_state["discord_user_id"])
-st.session_state["discord_user_id"] = discord_user_id
-if discord_user_id:
-    set_cookie_once("discord_user_id", discord_user_id)
-
-if discord_user_id:
-    status_res = requests.get(STATUS_URL, params={"discord_user_id": discord_user_id}).json()
-    is_active = status_res.get("active", False)
-    st.write(f"Subscription status: {status_res.get('status', 'unknown')}")
-else:
-    is_active = False
-
-if not is_active:
-    st.info("Upgrade to unlock full analysis, comparisons, top picks, and history.")
-
-if st.button("Generate Checkout Link"):
-    if not discord_user_id:
-        st.error("Please enter your Discord User ID.")
-    else:
-        resp = requests.post(SUBSCRIBE_URL, params={"discord_user_id": discord_user_id}, timeout=30)
-        try:
-            checkout = resp.json()
-        except Exception:
-            st.error(f"Checkout endpoint returned non-JSON (status {resp.status_code}).")
-            st.code(resp.text)
-            st.stop()
-        if "url" in checkout:
-            st.success("Checkout link generated.")
-            st.write(checkout["url"])
-        else:
-            st.error(checkout.get("error", "Unable to create checkout session."))
-
-if st.button("Manage Subscription"):
-    if not discord_user_id:
-        st.error("Please enter your Discord User ID.")
-    else:
-        resp = requests.post(PORTAL_URL, params={"discord_user_id": discord_user_id}, timeout=30)
-        try:
-            portal = resp.json()
-        except Exception:
-            st.error(f"Portal endpoint returned non-JSON (status {resp.status_code}).")
-            st.code(resp.text)
-            st.stop()
-        if "url" in portal:
-            st.success("Manage subscription link generated.")
-            st.write(portal["url"])
-        else:
-            st.error(portal.get("error", "Unable to create portal session."))
-
-compare_mode = st.checkbox("Compare multiple props/lines", value=False, disabled=not is_active)
+compare_mode = st.checkbox("Compare multiple props/lines", value=False)
 if compare_mode:
     compare_props = st.multiselect(
         "Props to compare",
@@ -339,10 +166,6 @@ else:
 
 if st.button("Evaluate"):
     with st.spinner("Running analysis..."):
-        if not is_active:
-            st.error("Please upgrade to continue.")
-            st.stop()
-
         lines = []
         for part in compare_lines_raw.split(","):
             part = part.strip()
@@ -441,12 +264,9 @@ if st.button("Evaluate"):
 
         st.progress(best["confidence"] / 100)
 
-        if is_active:
-            st.subheader("Why This Recommendation")
-            for reason in best["reasons"]:
-                st.write(f"- {reason}")
-        else:
-            st.info("Free preview: upgrade to see full analysis, reasons, and comparisons.")
+        st.subheader("Why This Recommendation")
+        for reason in best["reasons"]:
+            st.write(f"- {reason}")
 
         chart_data = [
             {"Window": "Last 5", "Hit Rate (%)": float(best["last_5_hit_rate"]), "Avg Stat": float(best["last_5_avg_stat"]),
@@ -459,34 +279,33 @@ if st.button("Evaluate"):
 
         render_hit_rate_bars(chart_data)
 
-        if is_active:
-            st.subheader("Comparison Table")
-            rows = []
-            for r in results:
-                rows.append({
-                    "Prop": r["prop"],
-                    "Line": r["line"],
-                    "Confidence": r["confidence"],
-                    "Rec": r["recommendation"],
-                    "L5 Hit%": r["last_5_hit_rate"],
-                    "L10 Hit%": r["last_10_hit_rate"],
-                    "H2H Hit%": r["h2h_hit_rate"],
-                    "L5 CI": f"{r['last_5_ci'][0]}-{r['last_5_ci'][1]}",
-                    "L10 CI": f"{r['last_10_ci'][0]}-{r['last_10_ci'][1]}",
-                    "H2H CI": f"{r['h2h_ci'][0]}-{r['h2h_ci'][1]}",
-                })
-            rows = sorted(rows, key=lambda x: x["Confidence"], reverse=True)
-            columns = ["Prop", "Line", "Confidence", "Rec", "L5 Hit%", "L10 Hit%", "H2H Hit%", "L5 CI", "L10 CI", "H2H CI"]
-            render_table_html(rows, columns)
+        st.subheader("Comparison Table")
+        rows = []
+        for r in results:
+            rows.append({
+                "Prop": r["prop"],
+                "Line": r["line"],
+                "Confidence": r["confidence"],
+                "Rec": r["recommendation"],
+                "L5 Hit%": r["last_5_hit_rate"],
+                "L10 Hit%": r["last_10_hit_rate"],
+                "H2H Hit%": r["h2h_hit_rate"],
+                "L5 CI": f"{r['last_5_ci'][0]}-{r['last_5_ci'][1]}",
+                "L10 CI": f"{r['last_10_ci'][0]}-{r['last_10_ci'][1]}",
+                "H2H CI": f"{r['h2h_ci'][0]}-{r['h2h_ci'][1]}",
+            })
+        rows = sorted(rows, key=lambda x: x["Confidence"], reverse=True)
+        columns = ["Prop", "Line", "Confidence", "Rec", "L5 Hit%", "L10 Hit%", "H2H Hit%", "L5 CI", "L10 CI", "H2H CI"]
+        render_table_html(rows, columns)
 
-            st.subheader("Top Picks")
-            top_n = 1 if len(rows) <= 1 else st.slider("Number of picks", 1, min(10, len(rows)), min(3, len(rows)))
-            render_table_html(rows[:top_n], columns)
+        st.subheader("Top Picks")
+        top_n = 1 if len(rows) <= 1 else st.slider("Number of picks", 1, min(10, len(rows)), min(3, len(rows)))
+        render_table_html(rows[:top_n], columns)
 
-            with st.expander("History"):
-                if st.button("Clear History"):
-                    st.session_state["history"] = []
-                if st.session_state["history"]:
-                    render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
-                else:
-                    st.write("No history yet.")
+        with st.expander("History"):
+            if st.button("Clear History"):
+                st.session_state["history"] = []
+            if st.session_state["history"]:
+                render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
+            else:
+                st.write("No history yet.")

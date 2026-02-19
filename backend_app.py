@@ -1462,24 +1462,76 @@ def analyze(
     offered_odds: Optional[int] = Query(None),
     include_injury: bool = Query(False),
 ):
-    return evaluate(
-        request=request,
-        player=player,
-        sport=sport,
-        prop=prop,
-        line=line,
-        opponent=opponent,
-        season_type=season_type,
-        window_1=window_1,
-        window_2=window_2,
-        hit_operator=hit_operator,
-        conf_l5_min=conf_l5_min,
-        conf_l10_min=conf_l10_min,
-        conf_h2h_good=conf_h2h_good,
-        conf_low_max=conf_low_max,
-        offered_odds=offered_odds,
-        include_injury=include_injury,
-    )
+    try:
+        return evaluate(
+            request=request,
+            player=player,
+            sport=sport,
+            prop=prop,
+            line=line,
+            opponent=opponent,
+            season_type=season_type,
+            window_1=window_1,
+            window_2=window_2,
+            hit_operator=hit_operator,
+            conf_l5_min=conf_l5_min,
+            conf_l10_min=conf_l10_min,
+            conf_h2h_good=conf_h2h_good,
+            conf_low_max=conf_low_max,
+            offered_odds=offered_odds,
+            include_injury=include_injury,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        normalized_sport = normalize_sport(sport) or "nba"
+        normalized_prop = normalize_prop(prop, normalized_sport)
+        l5_min = conf_l5_min if conf_l5_min is not None else CONF_L5_MIN
+        l10_min = conf_l10_min if conf_l10_min is not None else CONF_L10_MIN
+        h2h_good = conf_h2h_good if conf_h2h_good is not None else CONF_H2H_GOOD
+        low_max = conf_low_max if conf_low_max is not None else CONF_LOW_MAX
+        fallback_result = build_multi_sport_fallback(
+            sport=normalized_sport,
+            player=player,
+            prop=normalized_prop,
+            line=line,
+            opponent=opponent,
+            window_1=window_1,
+            window_2=window_2,
+            conf_l5_min=l5_min,
+            conf_l10_min=l10_min,
+            conf_h2h_good=h2h_good,
+            conf_low_max=low_max,
+        )
+        fallback_result["reasons"].insert(0, "Server error during live analysis; using deterministic fallback model.")
+        fallback_result["reasons"].insert(1, f"Internal error: {type(exc).__name__}")
+        implied_prob = implied_probability_from_american(offered_odds)
+        edge_pct = round(fallback_result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+        try:
+            pick_id = save_pick(
+                sport=fallback_result["sport"],
+                player=fallback_result["player"],
+                prop=fallback_result["prop"],
+                line=float(fallback_result["line"]),
+                recommendation_value=fallback_result["recommendation"],
+                confidence_value=float(fallback_result["confidence"]),
+                projected_prob=float(fallback_result.get("projected_probability", 50.0)),
+                offered_odds=offered_odds,
+                implied_prob=implied_prob,
+                edge_pct=edge_pct,
+                data_source=fallback_result.get("data_source", "fallback_model"),
+                fallback_used=bool(fallback_result.get("fallback_used", True)),
+                model_version=fallback_result.get("model_version", MODEL_VERSION),
+            )
+            fallback_result["pick_id"] = pick_id
+        except Exception:
+            fallback_result["pick_id"] = None
+            fallback_result["reasons"].append("Could not persist pick to database.")
+        fallback_result["offered_odds"] = offered_odds
+        fallback_result["implied_probability"] = implied_prob
+        fallback_result["edge_pct"] = edge_pct
+        fallback_result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+        return fallback_result
 
 
 def _odds_sport_key(sport: str):

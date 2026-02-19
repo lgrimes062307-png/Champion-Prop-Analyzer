@@ -1,7 +1,9 @@
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from nba_api.stats.endpoints import leaguedashteamstats, playergamelog
 from nba_api.stats.static import players, teams
+from pydantic import BaseModel
 import datetime
 import hashlib
 import os
@@ -10,6 +12,7 @@ import time
 import threading
 import sqlite3
 import requests
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 app = FastAPI()
@@ -164,6 +167,9 @@ EXTERNAL_TTL_SECONDS = int(os.getenv("EXTERNAL_TTL_SECONDS", "900"))
 EXTERNAL_HTTP_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_HTTP_TIMEOUT_SECONDS", "8"))
 EXTERNAL_HTTP_RETRIES = int(os.getenv("EXTERNAL_HTTP_RETRIES", "2"))
 EXTERNAL_RETRY_BACKOFF_SECONDS = float(os.getenv("EXTERNAL_RETRY_BACKOFF_SECONDS", "0.25"))
+NBA_HTTP_TIMEOUT_SECONDS = float(os.getenv("NBA_HTTP_TIMEOUT_SECONDS", "12"))
+NBA_HTTP_RETRIES = int(os.getenv("NBA_HTTP_RETRIES", "3"))
+NBA_RETRY_BACKOFF_SECONDS = float(os.getenv("NBA_RETRY_BACKOFF_SECONDS", "0.5"))
 NFL_SEASON_YEAR = int(os.getenv("NFL_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_SEASON_YEAR = int(os.getenv("SOCCER_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_LEAGUE = os.getenv("SOCCER_LEAGUE", "eng.1")
@@ -173,15 +179,41 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_BASE_URL = os.getenv("ODDS_API_BASE_URL", "https://api.the-odds-api.com/v4")
 ALERT_DISCORD_WEBHOOK_URL = os.getenv("ALERT_DISCORD_WEBHOOK_URL", "")
 ALERT_MIN_EDGE_PCT = float(os.getenv("ALERT_MIN_EDGE_PCT", "3.5"))
+NBA_LIVE_DISABLED = os.getenv("NBA_LIVE_DISABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 ESPN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; prop-analyzer/1.0)",
     "Accept": "application/json",
 }
+NBA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
+}
 _provider_state: Dict[str, dict] = {}
 _provider_lock = threading.Lock()
 _provider_fail_threshold = int(os.getenv("PROVIDER_FAIL_THRESHOLD", "4"))
 _provider_cooldown_seconds = int(os.getenv("PROVIDER_COOLDOWN_SECONDS", "120"))
+
+
+class AnalyzeRequestV2(BaseModel):
+    player: str
+    sport: str = "nba"
+    prop: str
+    line: float
+    opponent: str = ""
+    season_type: str = "Regular Season"
+    window_1: int = 5
+    window_2: int = 10
+    hit_operator: str = ""
+    conf_l5_min: Optional[float] = None
+    conf_l10_min: Optional[float] = None
+    conf_h2h_good: Optional[float] = None
+    conf_low_max: Optional[float] = None
+    offered_odds: Optional[int] = None
+    include_injury: bool = False
 
 
 def init_db():
@@ -307,10 +339,30 @@ def _provider_note_failure(provider: str, detail: str):
 
 
 def get_player_id(name: str):
-    for p in players.get_players():
-        if p["full_name"].lower() == name.lower():
+    needle = (name or "").strip().lower()
+    if not needle:
+        return None
+    all_players = players.get_players()
+    for p in all_players:
+        if p["full_name"].lower() == needle:
+            return p["id"]
+    for p in all_players:
+        if needle in p["full_name"].lower():
             return p["id"]
     return None
+
+
+def _nba_with_retries(fn):
+    retries = max(1, NBA_HTTP_RETRIES)
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(NBA_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    raise HTTPException(status_code=503, detail=f"NBA data provider request failed: {type(last_exc).__name__}")
 
 
 def get_team_id(abbrev: str):
@@ -1128,10 +1180,24 @@ def get_team_def_rating(season: str, season_type: str, opponent: str):
     if cached and (now - cached["ts"] < TEAM_STATS_TTL_SECONDS):
         stats = cached["df"]
     else:
-        stats = leaguedashteamstats.LeagueDashTeamStats(
-            season=season,
-            season_type_all_star=season_type
-        ).get_data_frames()[0]
+        def fetch_stats():
+            try:
+                endpoint = leaguedashteamstats.LeagueDashTeamStats(
+                    season=season,
+                    season_type_all_star=season_type,
+                    timeout=NBA_HTTP_TIMEOUT_SECONDS,
+                    headers=NBA_HEADERS,
+                )
+            except TypeError:
+                endpoint = leaguedashteamstats.LeagueDashTeamStats(
+                    season=season,
+                    season_type_all_star=season_type,
+                )
+            return endpoint.get_data_frames()[0]
+        try:
+            stats = _nba_with_retries(fetch_stats)
+        except HTTPException:
+            return "Unknown"
         _team_stats_cache[cache_key] = {"df": stats, "ts": now}
     if "DEF_RATING" not in stats.columns:
         return "Unknown"
@@ -1151,11 +1217,28 @@ def get_player_log(player_id: int, season: str, season_type: str):
     cached = _player_log_cache.get(cache_key)
     if cached and (now - cached["ts"] < DATA_TTL_SECONDS):
         return cached["df"]
-    df = playergamelog.PlayerGameLog(
-        player_id=player_id,
-        season=season,
-        season_type_all_star=season_type
-    ).get_data_frames()[0]
+    def fetch_logs():
+        try:
+            endpoint = playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season=season,
+                season_type_all_star=season_type,
+                timeout=NBA_HTTP_TIMEOUT_SECONDS,
+                headers=NBA_HEADERS,
+            )
+        except TypeError:
+            endpoint = playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season=season,
+                season_type_all_star=season_type,
+            )
+        return endpoint.get_data_frames()[0]
+    try:
+        df = _nba_with_retries(fetch_logs)
+    except HTTPException:
+        if cached:
+            return cached["df"]
+        raise
     _player_log_cache[cache_key] = {"df": df, "ts": now}
     return df
 
@@ -1172,6 +1255,16 @@ def build_reasons(prop: str, line: float, l5: float, l10: float, h2h: float, avg
 
 
 init_db()
+
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "prop-analyzer-api",
+        "model_version": MODEL_VERSION,
+        "endpoints": ["/health", "/analyze", "/evaluate", "/odds-edge", "/performance", "/picks"],
+    }
 
 
 @app.get("/evaluate")
@@ -1288,6 +1381,47 @@ def evaluate(
             )
         return result
 
+    if NBA_LIVE_DISABLED:
+        fallback_result = build_multi_sport_fallback(
+            sport="nba",
+            player=player,
+            prop=normalized_prop,
+            line=line,
+            opponent=opponent,
+            window_1=window_1,
+            window_2=window_2,
+            conf_l5_min=l5_min,
+            conf_l10_min=l10_min,
+            conf_h2h_good=h2h_good,
+            conf_low_max=low_max,
+        )
+        fallback_result["projection_label"] = "Minutes Projection"
+        fallback_result["reasons"].insert(0, "NBA live data disabled; using deterministic fallback model.")
+        result = fallback_result
+        implied_prob = implied_probability_from_american(offered_odds)
+        edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+        pick_id = save_pick(
+            sport=result["sport"],
+            player=result["player"],
+            prop=result["prop"],
+            line=float(result["line"]),
+            recommendation_value=result["recommendation"],
+            confidence_value=float(result["confidence"]),
+            projected_prob=float(result.get("projected_probability", 50.0)),
+            offered_odds=offered_odds,
+            implied_prob=implied_prob,
+            edge_pct=edge_pct,
+            data_source=result.get("data_source", "fallback_model"),
+            fallback_used=bool(result.get("fallback_used", True)),
+            model_version=result.get("model_version", MODEL_VERSION),
+        )
+        result["pick_id"] = pick_id
+        result["offered_odds"] = offered_odds
+        result["implied_probability"] = implied_prob
+        result["edge_pct"] = edge_pct
+        result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+        return result
+
     pid = get_player_id(player)
     if not pid:
         return {"error": "Player not found"}
@@ -1401,6 +1535,96 @@ def evaluate(
     return result
 
 
+def _analyze_safe(
+    request: Request,
+    player: str,
+    sport: str,
+    prop: str,
+    line: float,
+    opponent: str,
+    season_type: str,
+    window_1: int,
+    window_2: int,
+    hit_operator: str,
+    conf_l5_min: Optional[float],
+    conf_l10_min: Optional[float],
+    conf_h2h_good: Optional[float],
+    conf_low_max: Optional[float],
+    offered_odds: Optional[int],
+    include_injury: bool,
+):
+    try:
+        return evaluate(
+            request=request,
+            player=player,
+            sport=sport,
+            prop=prop,
+            line=line,
+            opponent=opponent,
+            season_type=season_type,
+            window_1=window_1,
+            window_2=window_2,
+            hit_operator=hit_operator,
+            conf_l5_min=conf_l5_min,
+            conf_l10_min=conf_l10_min,
+            conf_h2h_good=conf_h2h_good,
+            conf_low_max=conf_low_max,
+            offered_odds=offered_odds,
+            include_injury=include_injury,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        normalized_sport = normalize_sport(sport) or "nba"
+        normalized_prop = normalize_prop(prop, normalized_sport)
+        l5_min = conf_l5_min if conf_l5_min is not None else CONF_L5_MIN
+        l10_min = conf_l10_min if conf_l10_min is not None else CONF_L10_MIN
+        h2h_good = conf_h2h_good if conf_h2h_good is not None else CONF_H2H_GOOD
+        low_max = conf_low_max if conf_low_max is not None else CONF_LOW_MAX
+        fallback_result = build_multi_sport_fallback(
+            sport=normalized_sport,
+            player=player,
+            prop=normalized_prop,
+            line=line,
+            opponent=opponent,
+            window_1=window_1,
+            window_2=window_2,
+            conf_l5_min=l5_min,
+            conf_l10_min=l10_min,
+            conf_h2h_good=h2h_good,
+            conf_low_max=low_max,
+        )
+        fallback_result["reasons"].insert(0, "Server error during live analysis; using deterministic fallback model.")
+        fallback_result["reasons"].insert(1, f"Internal error: {type(exc).__name__}")
+        implied_prob = implied_probability_from_american(offered_odds)
+        edge_pct = round(fallback_result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+        try:
+            pick_id = save_pick(
+                sport=fallback_result["sport"],
+                player=fallback_result["player"],
+                prop=fallback_result["prop"],
+                line=float(fallback_result["line"]),
+                recommendation_value=fallback_result["recommendation"],
+                confidence_value=float(fallback_result["confidence"]),
+                projected_prob=float(fallback_result.get("projected_probability", 50.0)),
+                offered_odds=offered_odds,
+                implied_prob=implied_prob,
+                edge_pct=edge_pct,
+                data_source=fallback_result.get("data_source", "fallback_model"),
+                fallback_used=bool(fallback_result.get("fallback_used", True)),
+                model_version=fallback_result.get("model_version", MODEL_VERSION),
+            )
+            fallback_result["pick_id"] = pick_id
+        except Exception:
+            fallback_result["pick_id"] = None
+            fallback_result["reasons"].append("Could not persist pick to database.")
+        fallback_result["offered_odds"] = offered_odds
+        fallback_result["implied_probability"] = implied_prob
+        fallback_result["edge_pct"] = edge_pct
+        fallback_result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+        return fallback_result
+
+
 @app.get("/analyze")
 def analyze(
     request: Request,
@@ -1420,7 +1644,7 @@ def analyze(
     offered_odds: Optional[int] = Query(None),
     include_injury: bool = Query(False),
 ):
-    return evaluate(
+    return _analyze_safe(
         request=request,
         player=player,
         sport=sport,
@@ -1438,6 +1662,55 @@ def analyze(
         offered_odds=offered_odds,
         include_injury=include_injury,
     )
+
+
+@app.post("/v2/analyze")
+def analyze_v2(request: Request, payload: AnalyzeRequestV2):
+    request_id = str(uuid.uuid4())
+    try:
+        result = _analyze_safe(
+            request=request,
+            player=payload.player,
+            sport=payload.sport,
+            prop=payload.prop,
+            line=payload.line,
+            opponent=payload.opponent,
+            season_type=payload.season_type,
+            window_1=payload.window_1,
+            window_2=payload.window_2,
+            hit_operator=payload.hit_operator,
+            conf_l5_min=payload.conf_l5_min,
+            conf_l10_min=payload.conf_l10_min,
+            conf_h2h_good=payload.conf_h2h_good,
+            conf_low_max=payload.conf_low_max,
+            offered_odds=payload.offered_odds,
+            include_injury=payload.include_injury,
+        )
+        return {"ok": True, "request_id": request_id, "data": result, "error": None}
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        code = {
+            400: "bad_request",
+            401: "unauthorized",
+            404: "not_found",
+            422: "validation_error",
+            429: "rate_limited",
+            502: "provider_error",
+            503: "provider_unavailable",
+        }.get(exc.status_code, "api_error")
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "ok": False,
+                "request_id": request_id,
+                "data": None,
+                "error": {
+                    "code": code,
+                    "message": detail[:240],
+                    "retryable": exc.status_code in (429, 502, 503),
+                },
+            },
+        )
 
 
 def _odds_sport_key(sport: str):

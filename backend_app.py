@@ -1663,4 +1663,25 @@ def settle_pick(
     else:
         win = actual_stat > float(line) if is_over else actual_stat < float(line)
         result = "win" if win else "loss"
-        if offered_od
+        if offered_odds is None:
+            pnl = 1.0 if win else -1.0
+        else:
+            implied = implied_probability_from_american(int(offered_odds))
+            if implied is None:
+                pnl = 1.0 if win else -1.0
+            else:
+                # Risk 1 unit stake.
+                if win:
+                    if int(offered_odds) > 0:
+                        pnl = round(int(offered_odds) / 100.0, 3)
+                    else:
+                        pnl = round(100.0 / abs(int(offered_odds)), 3)
+                else:
+                    pnl = -1.0
+    cur.execute(
+        "UPDATE picks SET result = ?, actual_stat = ?, pnl_units = ? WHERE id = ?",
+        (result, float(actual_stat), float(pnl), pick_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "pick_id": pick_id, "result": result, "pnl_units": pnl}

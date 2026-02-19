@@ -179,6 +179,7 @@ if st.button("Evaluate"):
             lines = [line]
 
         results = []
+        errors = []
         for p in compare_props:
             for ln in lines:
                 params = {
@@ -204,33 +205,39 @@ if st.button("Evaluate"):
                         st.error("Offered Odds must be an integer like -110 or 120.")
                         st.stop()
                 resp = None
+                req_error = ""
                 for attempt in range(2):
                     try:
-                        resp = requests.get(BACKEND_URL, params=params, timeout=60)
+                        resp = requests.get(BACKEND_URL, params=params, timeout=30)
                         break
                     except ReadTimeout:
                         if attempt == 0:
+                            req_error = "Backend request timed out. Retrying once."
                             continue
-                        st.error("Backend timed out twice. Please try again in a moment.")
-                        st.stop()
+                        req_error = "Backend timed out twice."
                     except RequestException as exc:
-                        st.error(f"Backend request failed: {exc}")
-                        st.stop()
+                        req_error = f"Backend request failed: {exc}"
+                        break
+                if resp is None:
+                    errors.append(f"{p} @ {ln}: {req_error or 'Request failed.'}")
+                    continue
                 try:
                     res = resp.json()
                 except Exception:
-                    st.error("Backend returned an invalid response. Check your Backend URL and backend logs.")
-                    st.stop()
+                    errors.append(f"{p} @ {ln}: Backend returned an invalid response.")
+                    continue
                 if "error" in res:
-                    st.error(res["error"])
-                    st.stop()
+                    errors.append(f"{p} @ {ln}: {res['error']}")
+                    continue
                 if "confidence" not in res:
-                    st.error("Backend response is missing expected fields. Check backend deployment.")
-                    st.stop()
+                    errors.append(f"{p} @ {ln}: Backend response missing expected fields.")
+                    continue
                 results.append(res)
 
+        if errors:
+            st.warning("Some requests failed:\n- " + "\n- ".join(errors[:5]))
         if not results:
-            st.error("No results returned from backend.")
+            st.error("No results returned from backend. Check backend connectivity and provider status.")
             st.stop()
         best = max(results, key=lambda r: r["confidence"])
 
@@ -300,12 +307,4 @@ if st.button("Evaluate"):
 
         st.subheader("Top Picks")
         top_n = 1 if len(rows) <= 1 else st.slider("Number of picks", 1, min(10, len(rows)), min(3, len(rows)))
-        render_table_html(rows[:top_n], columns)
-
-        with st.expander("History"):
-            if st.button("Clear History"):
-                st.session_state["history"] = []
-            if st.session_state["history"]:
-                render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
-            else:
-                st.write("No history yet.")
+        render_table_html(rows[:top_n], columns

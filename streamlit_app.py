@@ -307,4 +307,4 @@ if st.button("Evaluate"):
 
         st.subheader("Top Picks")
         top_n = 1 if len(rows) <= 1 else st.slider("Number of picks", 1, min(10, len(rows)), min(3, len(rows)))
-        render_table_html(rows[:top_n], columns
+        render_table_html(rows[:top_n], columns)

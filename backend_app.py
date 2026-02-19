@@ -164,6 +164,9 @@ EXTERNAL_TTL_SECONDS = int(os.getenv("EXTERNAL_TTL_SECONDS", "900"))
 EXTERNAL_HTTP_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_HTTP_TIMEOUT_SECONDS", "8"))
 EXTERNAL_HTTP_RETRIES = int(os.getenv("EXTERNAL_HTTP_RETRIES", "2"))
 EXTERNAL_RETRY_BACKOFF_SECONDS = float(os.getenv("EXTERNAL_RETRY_BACKOFF_SECONDS", "0.25"))
+NBA_HTTP_TIMEOUT_SECONDS = float(os.getenv("NBA_HTTP_TIMEOUT_SECONDS", "12"))
+NBA_HTTP_RETRIES = int(os.getenv("NBA_HTTP_RETRIES", "3"))
+NBA_RETRY_BACKOFF_SECONDS = float(os.getenv("NBA_RETRY_BACKOFF_SECONDS", "0.5"))
 NFL_SEASON_YEAR = int(os.getenv("NFL_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_SEASON_YEAR = int(os.getenv("SOCCER_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_LEAGUE = os.getenv("SOCCER_LEAGUE", "eng.1")
@@ -178,6 +181,13 @@ NBA_LIVE_DISABLED = os.getenv("NBA_LIVE_DISABLED", "false").strip().lower() in (
 ESPN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; prop-analyzer/1.0)",
     "Accept": "application/json",
+}
+NBA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
 }
 _provider_state: Dict[str, dict] = {}
 _provider_lock = threading.Lock()
@@ -308,10 +318,30 @@ def _provider_note_failure(provider: str, detail: str):
 
 
 def get_player_id(name: str):
-    for p in players.get_players():
-        if p["full_name"].lower() == name.lower():
+    needle = (name or "").strip().lower()
+    if not needle:
+        return None
+    all_players = players.get_players()
+    for p in all_players:
+        if p["full_name"].lower() == needle:
+            return p["id"]
+    for p in all_players:
+        if needle in p["full_name"].lower():
             return p["id"]
     return None
+
+
+def _nba_with_retries(fn):
+    retries = max(1, NBA_HTTP_RETRIES)
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(NBA_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    raise HTTPException(status_code=503, detail=f"NBA data provider request failed: {type(last_exc).__name__}")
 
 
 def get_team_id(abbrev: str):
@@ -1129,10 +1159,24 @@ def get_team_def_rating(season: str, season_type: str, opponent: str):
     if cached and (now - cached["ts"] < TEAM_STATS_TTL_SECONDS):
         stats = cached["df"]
     else:
-        stats = leaguedashteamstats.LeagueDashTeamStats(
-            season=season,
-            season_type_all_star=season_type
-        ).get_data_frames()[0]
+        def fetch_stats():
+            try:
+                endpoint = leaguedashteamstats.LeagueDashTeamStats(
+                    season=season,
+                    season_type_all_star=season_type,
+                    timeout=NBA_HTTP_TIMEOUT_SECONDS,
+                    headers=NBA_HEADERS,
+                )
+            except TypeError:
+                endpoint = leaguedashteamstats.LeagueDashTeamStats(
+                    season=season,
+                    season_type_all_star=season_type,
+                )
+            return endpoint.get_data_frames()[0]
+        try:
+            stats = _nba_with_retries(fetch_stats)
+        except HTTPException:
+            return "Unknown"
         _team_stats_cache[cache_key] = {"df": stats, "ts": now}
     if "DEF_RATING" not in stats.columns:
         return "Unknown"
@@ -1152,11 +1196,28 @@ def get_player_log(player_id: int, season: str, season_type: str):
     cached = _player_log_cache.get(cache_key)
     if cached and (now - cached["ts"] < DATA_TTL_SECONDS):
         return cached["df"]
-    df = playergamelog.PlayerGameLog(
-        player_id=player_id,
-        season=season,
-        season_type_all_star=season_type
-    ).get_data_frames()[0]
+    def fetch_logs():
+        try:
+            endpoint = playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season=season,
+                season_type_all_star=season_type,
+                timeout=NBA_HTTP_TIMEOUT_SECONDS,
+                headers=NBA_HEADERS,
+            )
+        except TypeError:
+            endpoint = playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season=season,
+                season_type_all_star=season_type,
+            )
+        return endpoint.get_data_frames()[0]
+    try:
+        df = _nba_with_retries(fetch_logs)
+    except HTTPException:
+        if cached:
+            return cached["df"]
+        raise
     _player_log_cache[cache_key] = {"df": df, "ts": now}
     return df
 
@@ -1173,6 +1234,16 @@ def build_reasons(prop: str, line: float, l5: float, l10: float, h2h: float, avg
 
 
 init_db()
+
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "prop-analyzer-api",
+        "model_version": MODEL_VERSION,
+        "endpoints": ["/health", "/analyze", "/evaluate", "/odds-edge", "/performance", "/picks"],
+    }
 
 
 @app.get("/evaluate")

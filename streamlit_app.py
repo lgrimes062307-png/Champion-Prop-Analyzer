@@ -40,6 +40,8 @@ def render_hit_rate_bars(rows):
 
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "https://champion-prop-analyzer.onrender.com").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_ANALYZE_URL", f"{BACKEND_BASE_URL}/analyze")
+BACKEND_V2_URL = os.getenv("BACKEND_ANALYZE_V2_URL", f"{BACKEND_BASE_URL}/v2/analyze")
+BACKEND_USE_V2 = os.getenv("BACKEND_USE_V2", "true").strip().lower() in ("1", "true", "yes", "on")
 BACKEND_RETRIES = max(1, int(os.getenv("BACKEND_RETRIES", "3")))
 BACKEND_CONNECT_TIMEOUT_SECONDS = max(1, int(os.getenv("BACKEND_CONNECT_TIMEOUT_SECONDS", "10")))
 BACKEND_READ_TIMEOUT_SECONDS = max(5, int(os.getenv("BACKEND_READ_TIMEOUT_SECONDS", "75")))
@@ -186,7 +188,7 @@ if st.button("Evaluate"):
         errors = []
         for p in compare_props:
             for ln in lines:
-                params = {
+                payload = {
                     "player": player,
                     "sport": sport,
                     "prop": p,
@@ -200,11 +202,11 @@ if st.button("Evaluate"):
                     "conf_l10_min": conf_l10_min,
                     "conf_h2h_good": conf_h2h_good,
                     "conf_low_max": conf_low_max,
-                    "include_injury": str(include_injury).lower(),
+                    "include_injury": bool(include_injury),
                 }
                 if offered_odds_input.strip():
                     try:
-                        params["offered_odds"] = int(offered_odds_input.strip())
+                        payload["offered_odds"] = int(offered_odds_input.strip())
                     except ValueError:
                         st.error("Offered Odds must be an integer like -110 or 120.")
                         st.stop()
@@ -212,16 +214,25 @@ if st.button("Evaluate"):
                 req_error = ""
                 for attempt in range(BACKEND_RETRIES):
                     try:
-                        resp = requests.get(
-                            BACKEND_URL,
-                            params=params,
-                            timeout=(BACKEND_CONNECT_TIMEOUT_SECONDS, BACKEND_READ_TIMEOUT_SECONDS),
-                        )
+                        if BACKEND_USE_V2:
+                            resp = requests.post(
+                                BACKEND_V2_URL,
+                                json=payload,
+                                timeout=(BACKEND_CONNECT_TIMEOUT_SECONDS, BACKEND_READ_TIMEOUT_SECONDS),
+                            )
+                        else:
+                            resp = requests.get(
+                                BACKEND_URL,
+                                params=payload,
+                                timeout=(BACKEND_CONNECT_TIMEOUT_SECONDS, BACKEND_READ_TIMEOUT_SECONDS),
+                            )
                         if resp.status_code >= 400:
                             detail = ""
                             try:
                                 body = resp.json()
-                                detail = body.get("detail") or body.get("error") or ""
+                                if BACKEND_USE_V2 and isinstance(body.get("error"), dict):
+                                    detail = body["error"].get("message") or ""
+                                detail = detail or body.get("detail") or body.get("error") or ""
                             except Exception:
                                 detail = (resp.text or "").strip()[:180]
                             if 500 <= resp.status_code < 600 and attempt < (BACKEND_RETRIES - 1):
@@ -248,6 +259,13 @@ if st.button("Evaluate"):
                 except Exception:
                     errors.append(f"{p} @ {ln}: Backend returned an invalid response.")
                     continue
+                if BACKEND_USE_V2:
+                    if not res.get("ok"):
+                        err = res.get("error") or {}
+                        msg = err.get("message") or "Unknown API error."
+                        errors.append(f"{p} @ {ln}: {msg}")
+                        continue
+                    res = res.get("data") or {}
                 if "error" in res:
                     errors.append(f"{p} @ {ln}: {res['error']}")
                     continue

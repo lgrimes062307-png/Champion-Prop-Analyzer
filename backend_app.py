@@ -173,6 +173,7 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_BASE_URL = os.getenv("ODDS_API_BASE_URL", "https://api.the-odds-api.com/v4")
 ALERT_DISCORD_WEBHOOK_URL = os.getenv("ALERT_DISCORD_WEBHOOK_URL", "")
 ALERT_MIN_EDGE_PCT = float(os.getenv("ALERT_MIN_EDGE_PCT", "3.5"))
+NBA_LIVE_DISABLED = os.getenv("NBA_LIVE_DISABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 ESPN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; prop-analyzer/1.0)",
@@ -1286,6 +1287,47 @@ def evaluate(
                 f"Edge Alert #{pick_id}: {result['sport'].upper()} {result['player']} {result['prop']} {result['recommendation']} "
                 f"line {result['line']} edge {edge_pct:.2f}% confidence {result['confidence']}%"
             )
+        return result
+
+    if NBA_LIVE_DISABLED:
+        fallback_result = build_multi_sport_fallback(
+            sport="nba",
+            player=player,
+            prop=normalized_prop,
+            line=line,
+            opponent=opponent,
+            window_1=window_1,
+            window_2=window_2,
+            conf_l5_min=l5_min,
+            conf_l10_min=l10_min,
+            conf_h2h_good=h2h_good,
+            conf_low_max=low_max,
+        )
+        fallback_result["projection_label"] = "Minutes Projection"
+        fallback_result["reasons"].insert(0, "NBA live data disabled; using deterministic fallback model.")
+        result = fallback_result
+        implied_prob = implied_probability_from_american(offered_odds)
+        edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+        pick_id = save_pick(
+            sport=result["sport"],
+            player=result["player"],
+            prop=result["prop"],
+            line=float(result["line"]),
+            recommendation_value=result["recommendation"],
+            confidence_value=float(result["confidence"]),
+            projected_prob=float(result.get("projected_probability", 50.0)),
+            offered_odds=offered_odds,
+            implied_prob=implied_prob,
+            edge_pct=edge_pct,
+            data_source=result.get("data_source", "fallback_model"),
+            fallback_used=bool(result.get("fallback_used", True)),
+            model_version=result.get("model_version", MODEL_VERSION),
+        )
+        result["pick_id"] = pick_id
+        result["offered_odds"] = offered_odds
+        result["implied_probability"] = implied_prob
+        result["edge_pct"] = edge_pct
+        result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
         return result
 
     pid = get_player_id(player)

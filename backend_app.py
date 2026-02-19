@@ -161,6 +161,9 @@ _player_log_cache: Dict[tuple, dict] = {}
 _team_stats_cache: Dict[tuple, dict] = {}
 _external_cache: Dict[tuple, dict] = {}
 EXTERNAL_TTL_SECONDS = int(os.getenv("EXTERNAL_TTL_SECONDS", "900"))
+EXTERNAL_HTTP_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_HTTP_TIMEOUT_SECONDS", "8"))
+EXTERNAL_HTTP_RETRIES = int(os.getenv("EXTERNAL_HTTP_RETRIES", "2"))
+EXTERNAL_RETRY_BACKOFF_SECONDS = float(os.getenv("EXTERNAL_RETRY_BACKOFF_SECONDS", "0.25"))
 NFL_SEASON_YEAR = int(os.getenv("NFL_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_SEASON_YEAR = int(os.getenv("SOCCER_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_LEAGUE = os.getenv("SOCCER_LEAGUE", "eng.1")
@@ -522,9 +525,11 @@ def _fetch_json(url: str, params: Optional[dict] = None, headers: Optional[dict]
     if _provider_is_open(provider):
         raise HTTPException(status_code=503, detail=f"Provider {provider} is temporarily unavailable")
     last_exc = None
-    for attempt in range(3):
+    retries = max(1, EXTERNAL_HTTP_RETRIES)
+    timeout = max(1.0, EXTERNAL_HTTP_TIMEOUT_SECONDS)
+    for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params or {}, headers=headers or ESPN_HEADERS, timeout=25)
+            resp = requests.get(url, params=params or {}, headers=headers or ESPN_HEADERS, timeout=timeout)
             resp.raise_for_status()
             payload = resp.json()
             _provider_note_success(provider)
@@ -532,8 +537,8 @@ def _fetch_json(url: str, params: Optional[dict] = None, headers: Optional[dict]
         except Exception as exc:
             last_exc = exc
             _provider_note_failure(provider, f"{type(exc).__name__}: {exc}")
-            if attempt < 2:
-                time.sleep(0.35 * (attempt + 1))
+            if attempt < retries - 1:
+                time.sleep(EXTERNAL_RETRY_BACKOFF_SECONDS * (attempt + 1))
     raise HTTPException(status_code=502, detail=f"Provider request failed ({provider}): {last_exc}")
 
 
@@ -1212,21 +1217,28 @@ def evaluate(
 
     if normalized_sport != "nba":
         op = hit_operator.strip().lower() if hit_operator else HIT_OPERATOR
-        live_result = _build_live_multi_sport_result(
-            sport=normalized_sport,
-            player=player,
-            prop=normalized_prop,
-            line=line,
-            opponent=opponent,
-            window_1=window_1,
-            window_2=window_2,
-            op=op,
-            conf_l5_min=l5_min,
-            conf_l10_min=l10_min,
-            conf_h2h_good=h2h_good,
-            conf_low_max=low_max,
-            season_type=season_type,
-        )
+        live_result = None
+        live_error = ""
+        try:
+            live_result = _build_live_multi_sport_result(
+                sport=normalized_sport,
+                player=player,
+                prop=normalized_prop,
+                line=line,
+                opponent=opponent,
+                window_1=window_1,
+                window_2=window_2,
+                op=op,
+                conf_l5_min=l5_min,
+                conf_l10_min=l10_min,
+                conf_h2h_good=h2h_good,
+                conf_low_max=low_max,
+                season_type=season_type,
+            )
+        except HTTPException as exc:
+            live_error = f"Live provider error ({exc.status_code}): {exc.detail}"
+        except Exception as exc:
+            live_error = f"Live provider error: {type(exc).__name__}"
         if live_result:
             result = live_result
         else:
@@ -1244,6 +1256,8 @@ def evaluate(
                 conf_low_max=low_max,
             )
             fallback_result["reasons"].insert(0, "Live data unavailable; using deterministic fallback model.")
+            if live_error:
+                fallback_result["reasons"].insert(1, live_error[:180])
             result = fallback_result
         implied_prob = implied_probability_from_american(offered_odds)
         edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
@@ -1649,25 +1663,4 @@ def settle_pick(
     else:
         win = actual_stat > float(line) if is_over else actual_stat < float(line)
         result = "win" if win else "loss"
-        if offered_odds is None:
-            pnl = 1.0 if win else -1.0
-        else:
-            implied = implied_probability_from_american(int(offered_odds))
-            if implied is None:
-                pnl = 1.0 if win else -1.0
-            else:
-                # Risk 1 unit stake.
-                if win:
-                    if int(offered_odds) > 0:
-                        pnl = round(int(offered_odds) / 100.0, 3)
-                    else:
-                        pnl = round(100.0 / abs(int(offered_odds)), 3)
-                else:
-                    pnl = -1.0
-    cur.execute(
-        "UPDATE picks SET result = ?, actual_stat = ?, pnl_units = ? WHERE id = ?",
-        (result, float(actual_stat), float(pnl), pick_id),
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True, "pick_id": pick_id, "result": result, "pnl_units": pnl}
+        if offered_od

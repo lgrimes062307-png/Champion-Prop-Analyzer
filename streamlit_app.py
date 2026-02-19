@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 from requests.exceptions import ReadTimeout, RequestException
 import os
+import time
 
 st.set_page_config(layout="wide")
 st.title("Multi-Sport Prop Analyzer")
@@ -39,6 +40,9 @@ def render_hit_rate_bars(rows):
 
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "https://champion-prop-analyzer.onrender.com").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_ANALYZE_URL", f"{BACKEND_BASE_URL}/analyze")
+BACKEND_RETRIES = max(1, int(os.getenv("BACKEND_RETRIES", "3")))
+BACKEND_CONNECT_TIMEOUT_SECONDS = max(1, int(os.getenv("BACKEND_CONNECT_TIMEOUT_SECONDS", "10")))
+BACKEND_READ_TIMEOUT_SECONDS = max(5, int(os.getenv("BACKEND_READ_TIMEOUT_SECONDS", "75")))
 
 DEFAULT_PRESETS = {
     "Default": {"season_type": "Regular Season", "window_1": 5, "window_2": 10, "hit_operator": "gt",
@@ -206,15 +210,33 @@ if st.button("Evaluate"):
                         st.stop()
                 resp = None
                 req_error = ""
-                for attempt in range(2):
+                for attempt in range(BACKEND_RETRIES):
                     try:
-                        resp = requests.get(BACKEND_URL, params=params, timeout=30)
+                        resp = requests.get(
+                            BACKEND_URL,
+                            params=params,
+                            timeout=(BACKEND_CONNECT_TIMEOUT_SECONDS, BACKEND_READ_TIMEOUT_SECONDS),
+                        )
+                        if resp.status_code >= 400:
+                            detail = ""
+                            try:
+                                body = resp.json()
+                                detail = body.get("detail") or body.get("error") or ""
+                            except Exception:
+                                detail = (resp.text or "").strip()[:180]
+                            if 500 <= resp.status_code < 600 and attempt < (BACKEND_RETRIES - 1):
+                                req_error = f"Backend HTTP {resp.status_code}. Retrying."
+                                time.sleep(1.2 * (attempt + 1))
+                                continue
+                            req_error = f"Backend HTTP {resp.status_code}" + (f": {detail}" if detail else "")
+                            resp = None
                         break
                     except ReadTimeout:
-                        if attempt == 0:
-                            req_error = "Backend request timed out. Retrying once."
+                        if attempt < (BACKEND_RETRIES - 1):
+                            req_error = "Backend request timed out. Retrying."
+                            time.sleep(1.2 * (attempt + 1))
                             continue
-                        req_error = "Backend timed out twice."
+                        req_error = f"Backend timed out after {BACKEND_RETRIES} attempts."
                     except RequestException as exc:
                         req_error = f"Backend request failed: {exc}"
                         break
@@ -308,3 +330,11 @@ if st.button("Evaluate"):
         st.subheader("Top Picks")
         top_n = 1 if len(rows) <= 1 else st.slider("Number of picks", 1, min(10, len(rows)), min(3, len(rows)))
         render_table_html(rows[:top_n], columns)
+
+        with st.expander("History"):
+            if st.button("Clear History"):
+                st.session_state["history"] = []
+            if st.session_state["history"]:
+                render_table_html(st.session_state["history"], list(st.session_state["history"][0].keys()))
+            else:
+                st.write("No history yet.")

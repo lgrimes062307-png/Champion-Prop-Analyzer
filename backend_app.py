@@ -1427,12 +1427,90 @@ def evaluate(
         return {"error": "Player not found"}
 
     season = current_season()
-    df = get_player_log(pid, season, season_type)
-    if df is None or df.empty:
-        raise HTTPException(
-            status_code=503,
-            detail=f"No NBA game logs available for {player} in season {season} ({season_type}).",
+    try:
+        df = get_player_log(pid, season, season_type)
+    except HTTPException as exc:
+        fallback_result = build_multi_sport_fallback(
+            sport="nba",
+            player=player,
+            prop=normalized_prop,
+            line=line,
+            opponent=opponent,
+            window_1=window_1,
+            window_2=window_2,
+            conf_l5_min=l5_min,
+            conf_l10_min=l10_min,
+            conf_h2h_good=h2h_good,
+            conf_low_max=low_max,
         )
+        fallback_result["projection_label"] = "Minutes Projection"
+        fallback_result["reasons"].insert(0, "NBA live data unavailable; using deterministic fallback model.")
+        fallback_result["reasons"].insert(1, f"Live provider error ({exc.status_code}): {exc.detail}"[:180])
+        result = fallback_result
+        implied_prob = implied_probability_from_american(offered_odds)
+        edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+        pick_id = save_pick(
+            sport=result["sport"],
+            player=result["player"],
+            prop=result["prop"],
+            line=float(result["line"]),
+            recommendation_value=result["recommendation"],
+            confidence_value=float(result["confidence"]),
+            projected_prob=float(result.get("projected_probability", 50.0)),
+            offered_odds=offered_odds,
+            implied_prob=implied_prob,
+            edge_pct=edge_pct,
+            data_source=result.get("data_source", "fallback_model"),
+            fallback_used=bool(result.get("fallback_used", True)),
+            model_version=result.get("model_version", MODEL_VERSION),
+        )
+        result["pick_id"] = pick_id
+        result["offered_odds"] = offered_odds
+        result["implied_probability"] = implied_prob
+        result["edge_pct"] = edge_pct
+        result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+        return result
+    if df is None or df.empty:
+        fallback_result = build_multi_sport_fallback(
+            sport="nba",
+            player=player,
+            prop=normalized_prop,
+            line=line,
+            opponent=opponent,
+            window_1=window_1,
+            window_2=window_2,
+            conf_l5_min=l5_min,
+            conf_l10_min=l10_min,
+            conf_h2h_good=h2h_good,
+            conf_low_max=low_max,
+        )
+        fallback_result["projection_label"] = "Minutes Projection"
+        fallback_result["reasons"].insert(0, "NBA game logs were empty; using deterministic fallback model.")
+        fallback_result["reasons"].insert(1, f"No NBA game logs available for {player} in season {season} ({season_type})."[:180])
+        result = fallback_result
+        implied_prob = implied_probability_from_american(offered_odds)
+        edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+        pick_id = save_pick(
+            sport=result["sport"],
+            player=result["player"],
+            prop=result["prop"],
+            line=float(result["line"]),
+            recommendation_value=result["recommendation"],
+            confidence_value=float(result["confidence"]),
+            projected_prob=float(result.get("projected_probability", 50.0)),
+            offered_odds=offered_odds,
+            implied_prob=implied_prob,
+            edge_pct=edge_pct,
+            data_source=result.get("data_source", "fallback_model"),
+            fallback_used=bool(result.get("fallback_used", True)),
+            model_version=result.get("model_version", MODEL_VERSION),
+        )
+        result["pick_id"] = pick_id
+        result["offered_odds"] = offered_odds
+        result["implied_probability"] = implied_prob
+        result["edge_pct"] = edge_pct
+        result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+        return result
 
     last_1 = df.head(window_1)
     last_2 = df.head(window_2)

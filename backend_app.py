@@ -170,6 +170,11 @@ EXTERNAL_RETRY_BACKOFF_SECONDS = float(os.getenv("EXTERNAL_RETRY_BACKOFF_SECONDS
 NBA_HTTP_TIMEOUT_SECONDS = float(os.getenv("NBA_HTTP_TIMEOUT_SECONDS", "12"))
 NBA_HTTP_RETRIES = int(os.getenv("NBA_HTTP_RETRIES", "3"))
 NBA_RETRY_BACKOFF_SECONDS = float(os.getenv("NBA_RETRY_BACKOFF_SECONDS", "0.5"))
+BALDONTLIE_API_BASE_URL = os.getenv("BALDONTLIE_API_BASE_URL", "https://api.balldontlie.io/v1")
+BALDONTLIE_API_KEY = os.getenv("BALDONTLIE_API_KEY", "").strip()
+BALDONTLIE_HTTP_TIMEOUT_SECONDS = float(os.getenv("BALDONTLIE_HTTP_TIMEOUT_SECONDS", "10"))
+BALDONTLIE_HTTP_RETRIES = int(os.getenv("BALDONTLIE_HTTP_RETRIES", "2"))
+BALDONTLIE_RETRY_BACKOFF_SECONDS = float(os.getenv("BALDONTLIE_RETRY_BACKOFF_SECONDS", "0.3"))
 NFL_SEASON_YEAR = int(os.getenv("NFL_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_SEASON_YEAR = int(os.getenv("SOCCER_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_LEAGUE = os.getenv("SOCCER_LEAGUE", "eng.1")
@@ -289,6 +294,8 @@ def _provider_name_from_url(url: str):
         return "mlb_statsapi"
     if "espn.com" in url:
         return "espn"
+    if "balldontlie.io" in url:
+        return "balldontlie"
     if "the-odds-api.com" in url:
         return "odds_api"
     if "discord.com" in url:
@@ -685,6 +692,251 @@ def _season_label_to_year(season: str) -> int:
         return int(season.split("-")[0])
     except Exception:
         return datetime.datetime.now().year
+
+
+def _bdl_headers():
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "prop-analyzer/1.0",
+    }
+    if BALDONTLIE_API_KEY:
+        headers["Authorization"] = f"Bearer {BALDONTLIE_API_KEY}"
+    return headers
+
+
+def _bdl_fetch_json(path: str, params: Optional[dict] = None):
+    base = BALDONTLIE_API_BASE_URL.rstrip("/")
+    url = f"{base}/{path.lstrip('/')}"
+    provider = _provider_name_from_url(url)
+    if _provider_is_open(provider):
+        raise HTTPException(status_code=503, detail=f"Provider {provider} is temporarily unavailable")
+
+    last_exc = None
+    retries = max(1, BALDONTLIE_HTTP_RETRIES)
+    timeout = max(1.0, BALDONTLIE_HTTP_TIMEOUT_SECONDS)
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params or {}, headers=_bdl_headers(), timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+            _provider_note_success(provider)
+            return payload
+        except Exception as exc:
+            last_exc = exc
+            _provider_note_failure(provider, f"{type(exc).__name__}: {exc}")
+            if attempt < retries - 1:
+                time.sleep(BALDONTLIE_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    raise HTTPException(status_code=502, detail=f"Provider request failed ({provider}): {last_exc}")
+
+
+def _extract_minutes_from_bdl(val) -> float:
+    if isinstance(val, (int, float)):
+        return float(val)
+    if not isinstance(val, str):
+        return 0.0
+    txt = val.strip()
+    if not txt:
+        return 0.0
+    if ":" in txt:
+        head = txt.split(":", 1)[0]
+        try:
+            return float(head)
+        except Exception:
+            return 0.0
+    try:
+        return float(txt)
+    except Exception:
+        return 0.0
+
+
+def _bdl_stat_for_prop(prop: str, row: dict) -> Optional[float]:
+    pts = _safe_float(row.get("pts"))
+    reb = _safe_float(row.get("reb"))
+    ast = _safe_float(row.get("ast"))
+    if prop == "points":
+        return pts
+    if prop == "rebounds":
+        return reb
+    if prop == "assists":
+        return ast
+    if prop == "pts+reb":
+        return pts + reb
+    if prop == "pts+ast":
+        return pts + ast
+    if prop == "reb+ast":
+        return reb + ast
+    if prop == "pts+reb+ast":
+        return pts + reb + ast
+    return None
+
+
+def _build_live_nba_result_from_bdl(
+    player: str,
+    prop: str,
+    line: float,
+    opponent: str,
+    season_type: str,
+    window_1: int,
+    window_2: int,
+    op: str,
+    l5_min: float,
+    l10_min: float,
+    h2h_good: float,
+    low_max: float,
+):
+    if season_type.lower() != "regular season":
+        return None
+
+    cache_key = ("bdl_player", player.lower().strip())
+    player_item = _cached_external(cache_key)
+    if player_item is None:
+        pdata = _bdl_fetch_json("/players", params={"search": player, "per_page": 25})
+        items = pdata.get("data", []) if isinstance(pdata, dict) else []
+        needle = player.strip().lower()
+        player_item = None
+        for item in items:
+            full = f"{str(item.get('first_name', '')).strip()} {str(item.get('last_name', '')).strip()}".strip().lower()
+            if full == needle:
+                player_item = item
+                break
+        if player_item is None and items:
+            player_item = items[0]
+        _set_cached_external(cache_key, player_item)
+    if not player_item:
+        return None
+
+    player_id = player_item.get("id")
+    if not player_id:
+        return None
+
+    season = current_season()
+    season_year = _season_label_to_year(season)
+    season_years = [season_year, max(2000, season_year - 1)]
+
+    # Team map for opponent abbreviations.
+    teams_map_key = ("bdl_teams_map",)
+    teams_map = _cached_external(teams_map_key)
+    if teams_map is None:
+        tdata = _bdl_fetch_json("/teams", params={"per_page": 100})
+        trows = tdata.get("data", []) if isinstance(tdata, dict) else []
+        teams_map = {int(t.get("id")): str(t.get("abbreviation", "")).upper() for t in trows if t.get("id") is not None}
+        _set_cached_external(teams_map_key, teams_map)
+
+    stats_rows: List[dict] = []
+    for year in season_years:
+        sdata = _bdl_fetch_json(
+            "/stats",
+            params={
+                "player_ids[]": player_id,
+                "seasons[]": year,
+                "per_page": 100,
+                "page": 1,
+            },
+        )
+        rows = sdata.get("data", []) if isinstance(sdata, dict) else []
+        stats_rows.extend(rows)
+        if len(stats_rows) >= window_2:
+            break
+    if not stats_rows:
+        return None
+
+    def _game_sort_key(row):
+        game = row.get("game", {}) if isinstance(row.get("game"), dict) else {}
+        return str(game.get("date", ""))
+
+    stats_rows = sorted(stats_rows, key=_game_sort_key, reverse=True)
+
+    prop_values: List[float] = []
+    h2h_values: List[float] = []
+    usage_values: List[float] = []
+    opp_target = opponent.strip().upper() if opponent else ""
+
+    for row in stats_rows:
+        v = _bdl_stat_for_prop(prop, row)
+        if v is None:
+            continue
+        prop_values.append(float(v))
+        usage_values.append(_extract_minutes_from_bdl(row.get("min")))
+
+        if opp_target:
+            game = row.get("game", {}) if isinstance(row.get("game"), dict) else {}
+            home_id = game.get("home_team_id")
+            away_id = game.get("visitor_team_id")
+            team = row.get("team", {}) if isinstance(row.get("team"), dict) else {}
+            player_team_id = team.get("id")
+            opp_abbrev = ""
+            if player_team_id is not None and home_id is not None and away_id is not None:
+                opp_id = away_id if int(player_team_id) == int(home_id) else home_id
+                opp_abbrev = str(teams_map.get(int(opp_id), "")).upper()
+            if opp_abbrev == opp_target:
+                h2h_values.append(float(v))
+
+    if not prop_values:
+        return None
+
+    last_5_vals = prop_values[:window_1]
+    last_10_vals = prop_values[:window_2]
+    h2h_vals = h2h_values[:window_2]
+
+    l5_hits, l5_n, l5_rate, l5_ci = _ci_from_values(last_5_vals, line, op)
+    l10_hits, l10_n, l10_rate, l10_ci = _ci_from_values(last_10_vals, line, op)
+    if h2h_vals:
+        h2h_hits, h2h_n, h2h_rate, h2h_ci = _ci_from_values(h2h_vals, line, op)
+    else:
+        h2h_hits, h2h_n = 0, 0
+        h2h_rate = DEFAULT_H2H_WITH_OPP if opponent else DEFAULT_H2H
+        h2h_ci = (0.0, 0.0)
+
+    avg_l5 = _mean(last_5_vals)
+    avg_l10 = _mean(last_10_vals)
+    avg_h2h = _mean(h2h_vals) if h2h_vals else 0.0
+    conf = confidence(l5_rate, l10_rate, h2h_rate, l5_min, l10_min, h2h_good, low_max)
+    expected_stat = weighted_expected_stat(avg_l5, avg_l10, avg_h2h, bool(h2h_vals))
+    rec = line_recommendation(expected_stat, line)
+    proj_prob = projected_probability(l5_rate, l10_rate, h2h_rate, bool(h2h_vals))
+    minutes_proj = round(_mean(usage_values[:window_2]) if usage_values else 0.0, 1)
+    dvp = get_team_def_rating(season, season_type, opponent)
+
+    reasons = [
+        "Live source: BALldontlie game logs",
+        f"L5/L10 hit rates: {l5_rate:.1f}% / {l10_rate:.1f}%",
+        f"Expected {prop}: {expected_stat:.2f} vs line {line}",
+        f"Opponent context: {opponent.upper() if opponent else 'none'} ({dvp})",
+    ]
+
+    return {
+        "sport": "nba",
+        "player": player,
+        "prop": prop,
+        "line": line,
+        "last_5_hit_rate": l5_rate,
+        "last_10_hit_rate": l10_rate,
+        "h2h_hit_rate": h2h_rate,
+        "last_5_ci": l5_ci,
+        "last_10_ci": l10_ci,
+        "h2h_ci": h2h_ci,
+        "last_5_avg_stat": avg_l5,
+        "last_10_avg_stat": avg_l10,
+        "h2h_avg_stat": avg_h2h,
+        "confidence": conf,
+        "projected_probability": proj_prob,
+        "recommendation": rec,
+        "confidence_label": recommendation(conf),
+        "expected_stat": expected_stat,
+        "minutes_proj": minutes_proj,
+        "projection_label": "Minutes Projection",
+        "dvp": dvp,
+        "reasons": reasons,
+        "data_source": "balldontlie",
+        "fallback_used": False,
+        "source_timestamp": _now_iso(),
+        "model_version": MODEL_VERSION,
+        "samples": {
+            "last_5_games": l5_n,
+            "last_10_games": l10_n,
+            "h2h_games": h2h_n,
+        },
+    }
 
 
 def _mlb_find_player_id(player: str) -> Optional[int]:
@@ -1422,6 +1674,57 @@ def evaluate(
         result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
         return result
 
+    bdl_error = ""
+    try:
+        bdl_result = _build_live_nba_result_from_bdl(
+            player=player,
+            prop=normalized_prop,
+            line=line,
+            opponent=opponent,
+            season_type=season_type,
+            window_1=window_1,
+            window_2=window_2,
+            op=(hit_operator.strip().lower() if hit_operator else HIT_OPERATOR),
+            l5_min=l5_min,
+            l10_min=l10_min,
+            h2h_good=h2h_good,
+            low_max=low_max,
+        )
+        if bdl_result:
+            result = bdl_result
+            implied_prob = implied_probability_from_american(offered_odds)
+            edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+            pick_id = save_pick(
+                sport=result["sport"],
+                player=result["player"],
+                prop=result["prop"],
+                line=float(result["line"]),
+                recommendation_value=result["recommendation"],
+                confidence_value=float(result["confidence"]),
+                projected_prob=float(result.get("projected_probability", 50.0)),
+                offered_odds=offered_odds,
+                implied_prob=implied_prob,
+                edge_pct=edge_pct,
+                data_source=result.get("data_source", "balldontlie"),
+                fallback_used=False,
+                model_version=result.get("model_version", MODEL_VERSION),
+            )
+            result["pick_id"] = pick_id
+            result["offered_odds"] = offered_odds
+            result["implied_probability"] = implied_prob
+            result["edge_pct"] = edge_pct
+            result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+            if edge_pct is not None and edge_pct >= ALERT_MIN_EDGE_PCT and result.get("confidence", 0) >= 80:
+                _send_discord_alert(
+                    f"Edge Alert #{pick_id}: {result['sport'].upper()} {result['player']} {result['prop']} {result['recommendation']} "
+                    f"line {result['line']} edge {edge_pct:.2f}% confidence {result['confidence']}%"
+                )
+            return result
+    except HTTPException as exc:
+        bdl_error = f"BALldontlie error ({exc.status_code}): {exc.detail}"
+    except Exception as exc:
+        bdl_error = f"BALldontlie error: {type(exc).__name__}"
+
     pid = get_player_id(player)
     if not pid:
         return {"error": "Player not found"}
@@ -1446,6 +1749,8 @@ def evaluate(
         fallback_result["projection_label"] = "Minutes Projection"
         fallback_result["reasons"].insert(0, "NBA live data unavailable; using deterministic fallback model.")
         fallback_result["reasons"].insert(1, f"Live provider error ({exc.status_code}): {exc.detail}"[:180])
+        if bdl_error:
+            fallback_result["reasons"].insert(1, bdl_error[:180])
         result = fallback_result
         implied_prob = implied_probability_from_american(offered_odds)
         edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None

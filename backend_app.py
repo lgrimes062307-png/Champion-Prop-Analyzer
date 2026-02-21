@@ -172,6 +172,7 @@ NBA_HTTP_RETRIES = int(os.getenv("NBA_HTTP_RETRIES", "3"))
 NBA_RETRY_BACKOFF_SECONDS = float(os.getenv("NBA_RETRY_BACKOFF_SECONDS", "0.5"))
 BALDONTLIE_API_BASE_URL = os.getenv("BALDONTLIE_API_BASE_URL", "https://api.balldontlie.io/v1")
 BALDONTLIE_API_KEY = os.getenv("BALDONTLIE_API_KEY", "").strip()
+BALDONTLIE_ENABLED = os.getenv("BALDONTLIE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 BALDONTLIE_HTTP_TIMEOUT_SECONDS = float(os.getenv("BALDONTLIE_HTTP_TIMEOUT_SECONDS", "10"))
 BALDONTLIE_HTTP_RETRIES = int(os.getenv("BALDONTLIE_HTTP_RETRIES", "2"))
 BALDONTLIE_RETRY_BACKOFF_SECONDS = float(os.getenv("BALDONTLIE_RETRY_BACKOFF_SECONDS", "0.3"))
@@ -180,11 +181,13 @@ SOCCER_SEASON_YEAR = int(os.getenv("SOCCER_SEASON_YEAR", str(datetime.datetime.n
 SOCCER_LEAGUE = os.getenv("SOCCER_LEAGUE", "eng.1")
 SOCCER_TEAM = os.getenv("SOCCER_TEAM", "")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "2026.02.multi.v1")
+APP_BUILD = os.getenv("APP_BUILD", "2026-02-20.r1")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_BASE_URL = os.getenv("ODDS_API_BASE_URL", "https://api.the-odds-api.com/v4")
 ALERT_DISCORD_WEBHOOK_URL = os.getenv("ALERT_DISCORD_WEBHOOK_URL", "")
 ALERT_MIN_EDGE_PCT = float(os.getenv("ALERT_MIN_EDGE_PCT", "3.5"))
 NBA_LIVE_DISABLED = os.getenv("NBA_LIVE_DISABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+NBA_ESPN_FALLBACK_ENABLED = os.getenv("NBA_ESPN_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
 ESPN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; prop-analyzer/1.0)",
@@ -201,6 +204,7 @@ _provider_state: Dict[str, dict] = {}
 _provider_lock = threading.Lock()
 _provider_fail_threshold = int(os.getenv("PROVIDER_FAIL_THRESHOLD", "4"))
 _provider_cooldown_seconds = int(os.getenv("PROVIDER_COOLDOWN_SECONDS", "120"))
+_balldontlie_runtime_disabled_reason = ""
 
 
 class AnalyzeRequestV2(BaseModel):
@@ -303,7 +307,17 @@ def _provider_name_from_url(url: str):
     return "generic_http"
 
 
+def _balldontlie_is_enabled() -> bool:
+    if not BALDONTLIE_ENABLED:
+        return False
+    if not BALDONTLIE_API_KEY:
+        return False
+    return not bool(_balldontlie_runtime_disabled_reason)
+
+
 def _provider_is_open(provider: str):
+    if provider == "balldontlie" and not _balldontlie_is_enabled():
+        return False
     with _provider_lock:
         state = _provider_state.get(provider, {})
         opened_at = state.get("opened_at")
@@ -705,6 +719,9 @@ def _bdl_headers():
 
 
 def _bdl_fetch_json(path: str, params: Optional[dict] = None):
+    global _balldontlie_runtime_disabled_reason
+    if not _balldontlie_is_enabled():
+        raise HTTPException(status_code=503, detail="Provider balldontlie is disabled")
     base = BALDONTLIE_API_BASE_URL.rstrip("/")
     url = f"{base}/{path.lstrip('/')}"
     provider = _provider_name_from_url(url)
@@ -722,6 +739,9 @@ def _bdl_fetch_json(path: str, params: Optional[dict] = None):
             _provider_note_success(provider)
             return payload
         except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code in (401, 403):
+                _balldontlie_runtime_disabled_reason = f"auth_error_{status_code}"
             last_exc = exc
             _provider_note_failure(provider, f"{type(exc).__name__}: {exc}")
             if attempt < retries - 1:
@@ -928,6 +948,164 @@ def _build_live_nba_result_from_bdl(
         "dvp": dvp,
         "reasons": reasons,
         "data_source": "balldontlie",
+        "fallback_used": False,
+        "source_timestamp": _now_iso(),
+        "model_version": MODEL_VERSION,
+        "samples": {
+            "last_5_games": l5_n,
+            "last_10_games": l10_n,
+            "h2h_games": h2h_n,
+        },
+    }
+
+
+def _collect_nba_from_espn_payload(payload, prop: str, opponent: str):
+    rows = _flatten_dict_for_metrics(payload)
+    values = []
+    h2h_values = []
+    usage_values = []
+    opp_upper = opponent.strip().upper() if opponent else ""
+    opponent_keys = ("opponent", "opponentabbrev", "opponentabbr", "opp")
+    game_context_keys = set(opponent_keys) | {"date", "gamedate", "event", "eventid", "gameid"}
+
+    for row in rows:
+        row_keys = {str(k).lower().replace(" ", "").replace("_", "") for k in row.keys()}
+        if row_keys.isdisjoint(game_context_keys):
+            continue
+
+        pts = None
+        reb = None
+        ast = None
+        mins = None
+        for k, v in row.items():
+            key = str(k).lower().replace(" ", "").replace("_", "")
+            if key in {"points", "pts"}:
+                pts = _numeric(v)
+            elif key in {"rebounds", "reb", "totalrebounds"}:
+                reb = _numeric(v)
+            elif key in {"assists", "ast"}:
+                ast = _numeric(v)
+            elif key in {"minutes", "min", "minutesplayed"}:
+                mins = _numeric(v)
+
+        val = None
+        if prop == "points":
+            val = pts
+        elif prop == "rebounds":
+            val = reb
+        elif prop == "assists":
+            val = ast
+        elif prop == "pts+reb" and pts is not None and reb is not None:
+            val = pts + reb
+        elif prop == "pts+ast" and pts is not None and ast is not None:
+            val = pts + ast
+        elif prop == "reb+ast" and reb is not None and ast is not None:
+            val = reb + ast
+        elif prop == "pts+reb+ast" and pts is not None and reb is not None and ast is not None:
+            val = pts + reb + ast
+
+        if val is None:
+            continue
+
+        valf = float(val)
+        values.append(valf)
+        if mins is not None:
+            usage_values.append(float(mins))
+
+        if opp_upper:
+            row_opp = ""
+            for k in opponent_keys:
+                if k in row and row[k]:
+                    row_opp = str(row[k]).upper()
+                    break
+            if row_opp == opp_upper:
+                h2h_values.append(valf)
+
+    return values, h2h_values, usage_values
+
+
+def _build_live_nba_result_from_espn(
+    player: str,
+    prop: str,
+    line: float,
+    opponent: str,
+    season_type: str,
+    window_1: int,
+    window_2: int,
+    op: str,
+    l5_min: float,
+    l10_min: float,
+    h2h_good: float,
+    low_max: float,
+):
+    if season_type.lower() != "regular season":
+        return None
+
+    season = current_season()
+    season_year = _season_label_to_year(season)
+    athlete_id = _espn_find_player_id("basketball", "nba", player)
+    if not athlete_id:
+        return None
+
+    payload = _espn_gamelog_payload("basketball", "nba", athlete_id, season_year)
+    values, h2h_values, usage_values = _collect_nba_from_espn_payload(payload, prop, opponent)
+    if not values:
+        return None
+
+    last_5_vals = values[:window_1]
+    last_10_vals = values[:window_2]
+    h2h_vals = h2h_values[:window_2]
+
+    l5_hits, l5_n, l5_rate, l5_ci = _ci_from_values(last_5_vals, line, op)
+    l10_hits, l10_n, l10_rate, l10_ci = _ci_from_values(last_10_vals, line, op)
+    if h2h_vals:
+        h2h_hits, h2h_n, h2h_rate, h2h_ci = _ci_from_values(h2h_vals, line, op)
+    else:
+        h2h_hits, h2h_n = 0, 0
+        h2h_rate = DEFAULT_H2H_WITH_OPP if opponent else DEFAULT_H2H
+        h2h_ci = (0.0, 0.0)
+
+    avg_l5 = _mean(last_5_vals)
+    avg_l10 = _mean(last_10_vals)
+    avg_h2h = _mean(h2h_vals) if h2h_vals else 0.0
+    conf = confidence(l5_rate, l10_rate, h2h_rate, l5_min, l10_min, h2h_good, low_max)
+    expected_stat = weighted_expected_stat(avg_l5, avg_l10, avg_h2h, bool(h2h_vals))
+    rec = line_recommendation(expected_stat, line)
+    proj_prob = projected_probability(l5_rate, l10_rate, h2h_rate, bool(h2h_vals))
+    minutes_proj = round(_mean(usage_values[:window_2]) if usage_values else _mean(last_10_vals), 1)
+    dvp = get_team_def_rating(season, season_type, opponent)
+
+    reasons = [
+        "Live source: ESPN NBA game logs",
+        f"L5/L10 hit rates: {l5_rate:.1f}% / {l10_rate:.1f}%",
+        f"Expected {prop}: {expected_stat:.2f} vs line {line}",
+        f"Opponent context: {opponent.upper() if opponent else 'none'} ({dvp})",
+    ]
+
+    return {
+        "sport": "nba",
+        "player": player,
+        "prop": prop,
+        "line": line,
+        "last_5_hit_rate": l5_rate,
+        "last_10_hit_rate": l10_rate,
+        "h2h_hit_rate": h2h_rate,
+        "last_5_ci": l5_ci,
+        "last_10_ci": l10_ci,
+        "h2h_ci": h2h_ci,
+        "last_5_avg_stat": avg_l5,
+        "last_10_avg_stat": avg_l10,
+        "h2h_avg_stat": avg_h2h,
+        "confidence": conf,
+        "projected_probability": proj_prob,
+        "recommendation": rec,
+        "confidence_label": recommendation(conf),
+        "expected_stat": expected_stat,
+        "minutes_proj": minutes_proj,
+        "projection_label": "Minutes Projection",
+        "dvp": dvp,
+        "reasons": reasons,
+        "data_source": "espn_nba",
         "fallback_used": False,
         "source_timestamp": _now_iso(),
         "model_version": MODEL_VERSION,
@@ -1675,55 +1853,56 @@ def evaluate(
         return result
 
     bdl_error = ""
-    try:
-        bdl_result = _build_live_nba_result_from_bdl(
-            player=player,
-            prop=normalized_prop,
-            line=line,
-            opponent=opponent,
-            season_type=season_type,
-            window_1=window_1,
-            window_2=window_2,
-            op=(hit_operator.strip().lower() if hit_operator else HIT_OPERATOR),
-            l5_min=l5_min,
-            l10_min=l10_min,
-            h2h_good=h2h_good,
-            low_max=low_max,
-        )
-        if bdl_result:
-            result = bdl_result
-            implied_prob = implied_probability_from_american(offered_odds)
-            edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
-            pick_id = save_pick(
-                sport=result["sport"],
-                player=result["player"],
-                prop=result["prop"],
-                line=float(result["line"]),
-                recommendation_value=result["recommendation"],
-                confidence_value=float(result["confidence"]),
-                projected_prob=float(result.get("projected_probability", 50.0)),
-                offered_odds=offered_odds,
-                implied_prob=implied_prob,
-                edge_pct=edge_pct,
-                data_source=result.get("data_source", "balldontlie"),
-                fallback_used=False,
-                model_version=result.get("model_version", MODEL_VERSION),
+    if BALDONTLIE_ENABLED and BALDONTLIE_API_KEY:
+        try:
+            bdl_result = _build_live_nba_result_from_bdl(
+                player=player,
+                prop=normalized_prop,
+                line=line,
+                opponent=opponent,
+                season_type=season_type,
+                window_1=window_1,
+                window_2=window_2,
+                op=(hit_operator.strip().lower() if hit_operator else HIT_OPERATOR),
+                l5_min=l5_min,
+                l10_min=l10_min,
+                h2h_good=h2h_good,
+                low_max=low_max,
             )
-            result["pick_id"] = pick_id
-            result["offered_odds"] = offered_odds
-            result["implied_probability"] = implied_prob
-            result["edge_pct"] = edge_pct
-            result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
-            if edge_pct is not None and edge_pct >= ALERT_MIN_EDGE_PCT and result.get("confidence", 0) >= 80:
-                _send_discord_alert(
-                    f"Edge Alert #{pick_id}: {result['sport'].upper()} {result['player']} {result['prop']} {result['recommendation']} "
-                    f"line {result['line']} edge {edge_pct:.2f}% confidence {result['confidence']}%"
+            if bdl_result:
+                result = bdl_result
+                implied_prob = implied_probability_from_american(offered_odds)
+                edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+                pick_id = save_pick(
+                    sport=result["sport"],
+                    player=result["player"],
+                    prop=result["prop"],
+                    line=float(result["line"]),
+                    recommendation_value=result["recommendation"],
+                    confidence_value=float(result["confidence"]),
+                    projected_prob=float(result.get("projected_probability", 50.0)),
+                    offered_odds=offered_odds,
+                    implied_prob=implied_prob,
+                    edge_pct=edge_pct,
+                    data_source=result.get("data_source", "balldontlie"),
+                    fallback_used=False,
+                    model_version=result.get("model_version", MODEL_VERSION),
                 )
-            return result
-    except HTTPException as exc:
-        bdl_error = f"BALldontlie error ({exc.status_code}): {exc.detail}"
-    except Exception as exc:
-        bdl_error = f"BALldontlie error: {type(exc).__name__}"
+                result["pick_id"] = pick_id
+                result["offered_odds"] = offered_odds
+                result["implied_probability"] = implied_prob
+                result["edge_pct"] = edge_pct
+                result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+                if edge_pct is not None and edge_pct >= ALERT_MIN_EDGE_PCT and result.get("confidence", 0) >= 80:
+                    _send_discord_alert(
+                        f"Edge Alert #{pick_id}: {result['sport'].upper()} {result['player']} {result['prop']} {result['recommendation']} "
+                        f"line {result['line']} edge {edge_pct:.2f}% confidence {result['confidence']}%"
+                    )
+                return result
+        except HTTPException as exc:
+            bdl_error = f"BALldontlie error ({exc.status_code}): {exc.detail}"
+        except Exception as exc:
+            bdl_error = f"BALldontlie error: {type(exc).__name__}"
 
     pid = get_player_id(player)
     if not pid:
@@ -1733,6 +1912,58 @@ def evaluate(
     try:
         df = get_player_log(pid, season, season_type)
     except HTTPException as exc:
+        espn_error = ""
+        if NBA_ESPN_FALLBACK_ENABLED:
+            try:
+                espn_result = _build_live_nba_result_from_espn(
+                    player=player,
+                    prop=normalized_prop,
+                    line=line,
+                    opponent=opponent,
+                    season_type=season_type,
+                    window_1=window_1,
+                    window_2=window_2,
+                    op=(hit_operator.strip().lower() if hit_operator else HIT_OPERATOR),
+                    l5_min=l5_min,
+                    l10_min=l10_min,
+                    h2h_good=h2h_good,
+                    low_max=low_max,
+                )
+                if espn_result:
+                    result = espn_result
+                    implied_prob = implied_probability_from_american(offered_odds)
+                    edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+                    pick_id = save_pick(
+                        sport=result["sport"],
+                        player=result["player"],
+                        prop=result["prop"],
+                        line=float(result["line"]),
+                        recommendation_value=result["recommendation"],
+                        confidence_value=float(result["confidence"]),
+                        projected_prob=float(result.get("projected_probability", 50.0)),
+                        offered_odds=offered_odds,
+                        implied_prob=implied_prob,
+                        edge_pct=edge_pct,
+                        data_source=result.get("data_source", "espn_nba"),
+                        fallback_used=False,
+                        model_version=result.get("model_version", MODEL_VERSION),
+                    )
+                    result["pick_id"] = pick_id
+                    result["offered_odds"] = offered_odds
+                    result["implied_probability"] = implied_prob
+                    result["edge_pct"] = edge_pct
+                    result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+                    if edge_pct is not None and edge_pct >= ALERT_MIN_EDGE_PCT and result.get("confidence", 0) >= 80:
+                        _send_discord_alert(
+                            f"Edge Alert #{pick_id}: {result['sport'].upper()} {result['player']} {result['prop']} {result['recommendation']} "
+                            f"line {result['line']} edge {edge_pct:.2f}% confidence {result['confidence']}%"
+                        )
+                    return result
+            except HTTPException as espn_exc:
+                espn_error = f"ESPN NBA error ({espn_exc.status_code}): {espn_exc.detail}"
+            except Exception as espn_exc:
+                espn_error = f"ESPN NBA error: {type(espn_exc).__name__}"
+
         fallback_result = build_multi_sport_fallback(
             sport="nba",
             player=player,
@@ -1749,6 +1980,8 @@ def evaluate(
         fallback_result["projection_label"] = "Minutes Projection"
         fallback_result["reasons"].insert(0, "NBA live data unavailable; using deterministic fallback model.")
         fallback_result["reasons"].insert(1, f"Live provider error ({exc.status_code}): {exc.detail}"[:180])
+        if espn_error:
+            fallback_result["reasons"].insert(1, espn_error[:180])
         if bdl_error:
             fallback_result["reasons"].insert(1, bdl_error[:180])
         result = fallback_result
@@ -1776,6 +2009,58 @@ def evaluate(
         result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
         return result
     if df is None or df.empty:
+        espn_error = ""
+        if NBA_ESPN_FALLBACK_ENABLED:
+            try:
+                espn_result = _build_live_nba_result_from_espn(
+                    player=player,
+                    prop=normalized_prop,
+                    line=line,
+                    opponent=opponent,
+                    season_type=season_type,
+                    window_1=window_1,
+                    window_2=window_2,
+                    op=(hit_operator.strip().lower() if hit_operator else HIT_OPERATOR),
+                    l5_min=l5_min,
+                    l10_min=l10_min,
+                    h2h_good=h2h_good,
+                    low_max=low_max,
+                )
+                if espn_result:
+                    result = espn_result
+                    implied_prob = implied_probability_from_american(offered_odds)
+                    edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+                    pick_id = save_pick(
+                        sport=result["sport"],
+                        player=result["player"],
+                        prop=result["prop"],
+                        line=float(result["line"]),
+                        recommendation_value=result["recommendation"],
+                        confidence_value=float(result["confidence"]),
+                        projected_prob=float(result.get("projected_probability", 50.0)),
+                        offered_odds=offered_odds,
+                        implied_prob=implied_prob,
+                        edge_pct=edge_pct,
+                        data_source=result.get("data_source", "espn_nba"),
+                        fallback_used=False,
+                        model_version=result.get("model_version", MODEL_VERSION),
+                    )
+                    result["pick_id"] = pick_id
+                    result["offered_odds"] = offered_odds
+                    result["implied_probability"] = implied_prob
+                    result["edge_pct"] = edge_pct
+                    result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+                    if edge_pct is not None and edge_pct >= ALERT_MIN_EDGE_PCT and result.get("confidence", 0) >= 80:
+                        _send_discord_alert(
+                            f"Edge Alert #{pick_id}: {result['sport'].upper()} {result['player']} {result['prop']} {result['recommendation']} "
+                            f"line {result['line']} edge {edge_pct:.2f}% confidence {result['confidence']}%"
+                        )
+                    return result
+            except HTTPException as espn_exc:
+                espn_error = f"ESPN NBA error ({espn_exc.status_code}): {espn_exc.detail}"
+            except Exception as espn_exc:
+                espn_error = f"ESPN NBA error: {type(espn_exc).__name__}"
+
         fallback_result = build_multi_sport_fallback(
             sport="nba",
             player=player,
@@ -1792,6 +2077,10 @@ def evaluate(
         fallback_result["projection_label"] = "Minutes Projection"
         fallback_result["reasons"].insert(0, "NBA game logs were empty; using deterministic fallback model.")
         fallback_result["reasons"].insert(1, f"No NBA game logs available for {player} in season {season} ({season_type})."[:180])
+        if espn_error:
+            fallback_result["reasons"].insert(1, espn_error[:180])
+        if bdl_error:
+            fallback_result["reasons"].insert(1, bdl_error[:180])
         result = fallback_result
         implied_prob = implied_probability_from_american(offered_odds)
         edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
@@ -2196,11 +2485,49 @@ def health():
     return {
         "ok": True,
         "model_version": MODEL_VERSION,
+        "app_build": APP_BUILD,
+        "provider_mode": {
+            "nba_live_disabled": NBA_LIVE_DISABLED,
+            "balldontlie_enabled": _balldontlie_is_enabled(),
+            "balldontlie_config_enabled": BALDONTLIE_ENABLED,
+            "balldontlie_has_key": bool(BALDONTLIE_API_KEY),
+            "balldontlie_runtime_disabled_reason": _balldontlie_runtime_disabled_reason,
+            "nba_espn_fallback_enabled": NBA_ESPN_FALLBACK_ENABLED,
+        },
         "providers": providers,
         "cache": {
             "player_log_cache_size": len(_player_log_cache),
             "team_stats_cache_size": len(_team_stats_cache),
             "external_cache_size": len(_external_cache),
+        },
+    }
+
+
+@app.post("/admin/reset-runtime")
+def admin_reset_runtime(admin_secret: str = Query(..., min_length=1)):
+    if not ADMIN_SECRET or admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+    with _provider_lock:
+        provider_count = len(_provider_state)
+        _provider_state.clear()
+    with _rate_lock:
+        rate_identity_count = len(_rate_store)
+        _rate_store.clear()
+    external_cache_size = len(_external_cache)
+    player_cache_size = len(_player_log_cache)
+    team_cache_size = len(_team_stats_cache)
+    _external_cache.clear()
+    _player_log_cache.clear()
+    _team_stats_cache.clear()
+    return {
+        "ok": True,
+        "reset_at": _now_iso(),
+        "cleared": {
+            "providers": provider_count,
+            "rate_limit_identities": rate_identity_count,
+            "external_cache": external_cache_size,
+            "player_log_cache": player_cache_size,
+            "team_stats_cache": team_cache_size,
         },
     }
 

@@ -167,8 +167,8 @@ EXTERNAL_TTL_SECONDS = int(os.getenv("EXTERNAL_TTL_SECONDS", "900"))
 EXTERNAL_HTTP_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_HTTP_TIMEOUT_SECONDS", "8"))
 EXTERNAL_HTTP_RETRIES = int(os.getenv("EXTERNAL_HTTP_RETRIES", "2"))
 EXTERNAL_RETRY_BACKOFF_SECONDS = float(os.getenv("EXTERNAL_RETRY_BACKOFF_SECONDS", "0.25"))
-NBA_HTTP_TIMEOUT_SECONDS = float(os.getenv("NBA_HTTP_TIMEOUT_SECONDS", "12"))
-NBA_HTTP_RETRIES = int(os.getenv("NBA_HTTP_RETRIES", "3"))
+NBA_HTTP_TIMEOUT_SECONDS = float(os.getenv("NBA_HTTP_TIMEOUT_SECONDS", "10"))
+NBA_HTTP_RETRIES = int(os.getenv("NBA_HTTP_RETRIES", "2"))
 NBA_RETRY_BACKOFF_SECONDS = float(os.getenv("NBA_RETRY_BACKOFF_SECONDS", "0.5"))
 BALDONTLIE_API_BASE_URL = os.getenv("BALDONTLIE_API_BASE_URL", "https://api.balldontlie.io/v1")
 BALDONTLIE_API_KEY = os.getenv("BALDONTLIE_API_KEY", "").strip()
@@ -188,6 +188,7 @@ ALERT_DISCORD_WEBHOOK_URL = os.getenv("ALERT_DISCORD_WEBHOOK_URL", "")
 ALERT_MIN_EDGE_PCT = float(os.getenv("ALERT_MIN_EDGE_PCT", "3.5"))
 NBA_LIVE_DISABLED = os.getenv("NBA_LIVE_DISABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 NBA_ESPN_FALLBACK_ENABLED = os.getenv("NBA_ESPN_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+NBA_PRIMARY_SOURCE = os.getenv("NBA_PRIMARY_SOURCE", "espn").strip().lower()
 
 ESPN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; prop-analyzer/1.0)",
@@ -374,13 +375,19 @@ def get_player_id(name: str):
 
 
 def _nba_with_retries(fn):
+    provider = "nba_api"
+    if _provider_is_open(provider):
+        raise HTTPException(status_code=503, detail="NBA data provider is temporarily unavailable")
     retries = max(1, NBA_HTTP_RETRIES)
     last_exc = None
     for attempt in range(retries):
         try:
-            return fn()
+            result = fn()
+            _provider_note_success(provider)
+            return result
         except Exception as exc:
             last_exc = exc
+            _provider_note_failure(provider, f"{type(exc).__name__}: {exc}")
             if attempt < retries - 1:
                 time.sleep(NBA_RETRY_BACKOFF_SECONDS * (attempt + 1))
     raise HTTPException(status_code=503, detail=f"NBA data provider request failed: {type(last_exc).__name__}")
@@ -960,33 +967,22 @@ def _build_live_nba_result_from_bdl(
 
 
 def _collect_nba_from_espn_payload(payload, prop: str, opponent: str):
-    rows = _flatten_dict_for_metrics(payload)
     values = []
     h2h_values = []
     usage_values = []
     opp_upper = opponent.strip().upper() if opponent else ""
-    opponent_keys = ("opponent", "opponentabbrev", "opponentabbr", "opp")
-    game_context_keys = set(opponent_keys) | {"date", "gamedate", "event", "eventid", "gameid"}
+    names = payload.get("names", []) if isinstance(payload, dict) else []
+    idx_minutes = names.index("minutes") if "minutes" in names else None
+    idx_points = names.index("points") if "points" in names else None
+    idx_reb = names.index("totalRebounds") if "totalRebounds" in names else None
+    idx_ast = names.index("assists") if "assists" in names else None
+    event_map = payload.get("events", {}) if isinstance(payload, dict) else {}
 
-    for row in rows:
-        row_keys = {str(k).lower().replace(" ", "").replace("_", "") for k in row.keys()}
-        if row_keys.isdisjoint(game_context_keys):
-            continue
-
-        pts = None
-        reb = None
-        ast = None
-        mins = None
-        for k, v in row.items():
-            key = str(k).lower().replace(" ", "").replace("_", "")
-            if key in {"points", "pts"}:
-                pts = _numeric(v)
-            elif key in {"rebounds", "reb", "totalrebounds"}:
-                reb = _numeric(v)
-            elif key in {"assists", "ast"}:
-                ast = _numeric(v)
-            elif key in {"minutes", "min", "minutesplayed"}:
-                mins = _numeric(v)
+    def _pick_value(stats_row: List[str]):
+        pts = _numeric(stats_row[idx_points]) if idx_points is not None and idx_points < len(stats_row) else None
+        reb = _numeric(stats_row[idx_reb]) if idx_reb is not None and idx_reb < len(stats_row) else None
+        ast = _numeric(stats_row[idx_ast]) if idx_ast is not None and idx_ast < len(stats_row) else None
+        mins = _numeric(stats_row[idx_minutes]) if idx_minutes is not None and idx_minutes < len(stats_row) else None
 
         val = None
         if prop == "points":
@@ -1003,15 +999,79 @@ def _collect_nba_from_espn_payload(payload, prop: str, opponent: str):
             val = reb + ast
         elif prop == "pts+reb+ast" and pts is not None and reb is not None and ast is not None:
             val = pts + reb + ast
+        return val, mins
 
+    # Preferred parser for ESPN gamelog structure.
+    season_types = payload.get("seasonTypes", []) if isinstance(payload, dict) else []
+    for season_block in season_types:
+        for category in season_block.get("categories", []) or []:
+            if str(category.get("type", "")).lower() != "event":
+                continue
+            for event_entry in category.get("events", []) or []:
+                stats_row = event_entry.get("stats", []) or []
+                if not isinstance(stats_row, list):
+                    continue
+                val, mins = _pick_value(stats_row)
+                if val is None:
+                    continue
+                valf = float(val)
+                values.append(valf)
+                if mins is not None:
+                    usage_values.append(float(mins))
+                if opp_upper:
+                    event_id = str(event_entry.get("eventId", ""))
+                    event_meta = event_map.get(event_id, {}) if isinstance(event_map, dict) else {}
+                    opp_abbrev = str(((event_meta.get("opponent") or {}).get("abbreviation") or "")).upper()
+                    if opp_abbrev == opp_upper:
+                        h2h_values.append(valf)
+
+    if values:
+        return values, h2h_values, usage_values
+
+    # Fallback parser for older/different ESPN payloads.
+    rows = _flatten_dict_for_metrics(payload)
+    opponent_keys = ("opponent", "opponentabbrev", "opponentabbr", "opp")
+    game_context_keys = set(opponent_keys) | {"date", "gamedate", "event", "eventid", "gameid"}
+
+    for row in rows:
+        row_keys = {str(k).lower().replace(" ", "").replace("_", "") for k in row.keys()}
+        if row_keys.isdisjoint(game_context_keys):
+            continue
+        pts = None
+        reb = None
+        ast = None
+        mins = None
+        for k, v in row.items():
+            key = str(k).lower().replace(" ", "").replace("_", "")
+            if key in {"points", "pts"}:
+                pts = _numeric(v)
+            elif key in {"rebounds", "reb", "totalrebounds"}:
+                reb = _numeric(v)
+            elif key in {"assists", "ast"}:
+                ast = _numeric(v)
+            elif key in {"minutes", "min", "minutesplayed"}:
+                mins = _numeric(v)
+        val = None
+        if prop == "points":
+            val = pts
+        elif prop == "rebounds":
+            val = reb
+        elif prop == "assists":
+            val = ast
+        elif prop == "pts+reb" and pts is not None and reb is not None:
+            val = pts + reb
+        elif prop == "pts+ast" and pts is not None and ast is not None:
+            val = pts + ast
+        elif prop == "reb+ast" and reb is not None and ast is not None:
+            val = reb + ast
+        elif prop == "pts+reb+ast" and pts is not None and reb is not None and ast is not None:
+            val = pts + reb + ast
         if val is None:
             continue
-
         valf = float(val)
         values.append(valf)
         if mins is not None:
             usage_values.append(float(mins))
-
         if opp_upper:
             row_opp = ""
             for k in opponent_keys:
@@ -1171,20 +1231,60 @@ def _espn_find_player_id(sport_path: str, league_path: str, player: str) -> Opti
     cached = _cached_external(cache_key)
     if cached is not None:
         return cached
-    url = f"https://site.web.api.espn.com/apis/common/v3/sports/{sport_path}/{league_path}/athletes"
-    data = _fetch_json(url, params={"limit": 10, "page": 1, "search": player})
-    items = data.get("items", []) or data.get("athletes", [])
+    # NOTE: ESPN's common/v3 athletes listing endpoint currently returns 400 for search queries.
+    # Use the search API and parse athlete id from uid format: s:40~l:46~a:<id>.
+    query = player.strip()
     athlete_id = None
-    needle = player.strip().lower()
-    for item in items:
-        display = str(item.get("displayName", "")).strip().lower()
-        full_name = str(item.get("fullName", "")).strip().lower()
-        if display == needle or full_name == needle:
-            athlete_id = int(item.get("id"))
-            break
-    if athlete_id is None and items:
-        candidate = items[0].get("id")
-        athlete_id = int(candidate) if candidate is not None else None
+    slug_expected = league_path.strip().lower()
+    sport_expected = sport_path.strip().lower()
+    try:
+        search_url = "https://site.api.espn.com/apis/search/v2"
+        data = _fetch_json(search_url, params={"query": query})
+        blocks = data.get("results", []) if isinstance(data, dict) else []
+        needle = query.lower()
+        player_rows = []
+        for block in blocks:
+            if str(block.get("type", "")).lower() != "player":
+                continue
+            player_rows.extend(block.get("contents", []) or [])
+
+        def _athlete_id_from_uid(uid: str) -> Optional[int]:
+            if not uid or "~a:" not in uid:
+                return None
+            try:
+                return int(uid.split("~a:")[-1])
+            except Exception:
+                return None
+
+        best_candidate = None
+        for item in player_rows:
+            display_name = str(item.get("displayName", "")).strip().lower()
+            default_slug = str(item.get("defaultLeagueSlug", "")).strip().lower()
+            sport_name = str(item.get("sport", "")).strip().lower()
+            uid = str(item.get("uid", ""))
+            parsed_id = _athlete_id_from_uid(uid)
+            if parsed_id is None:
+                continue
+
+            if sport_expected == "soccer":
+                league_match = (sport_name == "soccer")
+            else:
+                league_match = (default_slug == slug_expected) if default_slug else True
+
+            if not league_match:
+                continue
+
+            if display_name == needle:
+                athlete_id = parsed_id
+                break
+            if best_candidate is None:
+                best_candidate = parsed_id
+
+        if athlete_id is None:
+            athlete_id = best_candidate
+    except Exception:
+        athlete_id = None
+
     _set_cached_external(cache_key, athlete_id)
     return athlete_id
 
@@ -1852,8 +1952,105 @@ def evaluate(
         result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
         return result
 
+    if NBA_PRIMARY_SOURCE == "espn":
+        espn_primary_error = ""
+        try:
+            espn_result = _build_live_nba_result_from_espn(
+                player=player,
+                prop=normalized_prop,
+                line=line,
+                opponent=opponent,
+                season_type=season_type,
+                window_1=window_1,
+                window_2=window_2,
+                op=(hit_operator.strip().lower() if hit_operator else HIT_OPERATOR),
+                l5_min=l5_min,
+                l10_min=l10_min,
+                h2h_good=h2h_good,
+                low_max=low_max,
+            )
+            if espn_result:
+                result = espn_result
+                implied_prob = implied_probability_from_american(offered_odds)
+                edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+                pick_id = save_pick(
+                    sport=result["sport"],
+                    player=result["player"],
+                    prop=result["prop"],
+                    line=float(result["line"]),
+                    recommendation_value=result["recommendation"],
+                    confidence_value=float(result["confidence"]),
+                    projected_prob=float(result.get("projected_probability", 50.0)),
+                    offered_odds=offered_odds,
+                    implied_prob=implied_prob,
+                    edge_pct=edge_pct,
+                    data_source=result.get("data_source", "espn_nba"),
+                    fallback_used=False,
+                    model_version=result.get("model_version", MODEL_VERSION),
+                )
+                result["pick_id"] = pick_id
+                result["offered_odds"] = offered_odds
+                result["implied_probability"] = implied_prob
+                result["edge_pct"] = edge_pct
+                result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+                if edge_pct is not None and edge_pct >= ALERT_MIN_EDGE_PCT and result.get("confidence", 0) >= 80:
+                    _send_discord_alert(
+                        f"Edge Alert #{pick_id}: {result['sport'].upper()} {result['player']} {result['prop']} {result['recommendation']} "
+                        f"line {result['line']} edge {edge_pct:.2f}% confidence {result['confidence']}%"
+                    )
+                return result
+            espn_primary_error = "ESPN NBA primary source returned no data"
+        except HTTPException as exc:
+            espn_primary_error = f"ESPN NBA primary error ({exc.status_code}): {exc.detail}"
+        except Exception as exc:
+            espn_primary_error = f"ESPN NBA primary error: {type(exc).__name__}"
+
+        fallback_result = build_multi_sport_fallback(
+            sport="nba",
+            player=player,
+            prop=normalized_prop,
+            line=line,
+            opponent=opponent,
+            window_1=window_1,
+            window_2=window_2,
+            conf_l5_min=l5_min,
+            conf_l10_min=l10_min,
+            conf_h2h_good=h2h_good,
+            conf_low_max=low_max,
+        )
+        fallback_result["projection_label"] = "Minutes Projection"
+        fallback_result["reasons"].insert(0, "NBA primary source failed; using deterministic fallback model.")
+        if espn_primary_error:
+            fallback_result["reasons"].insert(1, espn_primary_error[:180])
+        result = fallback_result
+        implied_prob = implied_probability_from_american(offered_odds)
+        edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None
+        pick_id = save_pick(
+            sport=result["sport"],
+            player=result["player"],
+            prop=result["prop"],
+            line=float(result["line"]),
+            recommendation_value=result["recommendation"],
+            confidence_value=float(result["confidence"]),
+            projected_prob=float(result.get("projected_probability", 50.0)),
+            offered_odds=offered_odds,
+            implied_prob=implied_prob,
+            edge_pct=edge_pct,
+            data_source=result.get("data_source", "fallback_model"),
+            fallback_used=bool(result.get("fallback_used", True)),
+            model_version=result.get("model_version", MODEL_VERSION),
+        )
+        result["pick_id"] = pick_id
+        result["offered_odds"] = offered_odds
+        result["implied_probability"] = implied_prob
+        result["edge_pct"] = edge_pct
+        result["injury_context"] = get_injury_context(normalized_sport, player) if include_injury else {"status": "not_requested"}
+        return result
+
     bdl_error = ""
-    if BALDONTLIE_ENABLED and BALDONTLIE_API_KEY:
+    # Keep nba_api as the default primary path. BALldontlie can be explicitly
+    # promoted to primary via NBA_PRIMARY_SOURCE=balldontlie.
+    if NBA_PRIMARY_SOURCE == "balldontlie" and BALDONTLIE_ENABLED and BALDONTLIE_API_KEY:
         try:
             bdl_result = _build_live_nba_result_from_bdl(
                 player=player,
@@ -2488,6 +2685,7 @@ def health():
         "app_build": APP_BUILD,
         "provider_mode": {
             "nba_live_disabled": NBA_LIVE_DISABLED,
+            "nba_primary_source": NBA_PRIMARY_SOURCE,
             "balldontlie_enabled": _balldontlie_is_enabled(),
             "balldontlie_config_enabled": BALDONTLIE_ENABLED,
             "balldontlie_has_key": bool(BALDONTLIE_API_KEY),

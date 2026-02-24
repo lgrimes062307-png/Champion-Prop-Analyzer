@@ -1,5 +1,7 @@
 import os
 import time
+import html
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -235,6 +237,67 @@ def _to_df(rows: List[Dict[str, Any]]):
     if pd is None:
         return rows
     return pd.DataFrame(rows)
+
+
+def _cell_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _rows_from_any(data: Any) -> List[Dict[str, Any]]:
+    if data is None:
+        return []
+    if pd is not None and isinstance(data, pd.DataFrame):
+        return data.where(data.notna(), None).to_dict(orient="records")
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        if not data:
+            return []
+        if all(isinstance(x, dict) for x in data):
+            return data
+        return [{"value": _cell_to_text(x)} for x in data]
+    return [{"value": _cell_to_text(data)}]
+
+
+def _render_table(data: Any, *, max_rows: int = 300) -> None:
+    rows = _rows_from_any(data)
+    if not rows:
+        st.write("No data.")
+        return
+
+    columns: List[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in columns:
+                columns.append(key)
+
+    show_rows = rows[:max_rows]
+    header_html = "".join(f"<th>{html.escape(str(c))}</th>" for c in columns)
+    body_parts: List[str] = []
+    for row in show_rows:
+        cells = "".join(f"<td>{html.escape(_cell_to_text(row.get(col, '')))}</td>" for col in columns)
+        body_parts.append(f"<tr>{cells}</tr>")
+
+    table_html = (
+        "<div style='overflow-x:auto;'>"
+        "<table style='width:100%; border-collapse:collapse; font-size:13px;'>"
+        "<thead><tr style='background:#f1f3f6;'>"
+        f"{header_html}"
+        "</tr></thead>"
+        "<tbody>"
+        f"{''.join(body_parts)}"
+        "</tbody></table></div>"
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
+    if len(rows) > max_rows:
+        st.caption(f"Showing {max_rows} of {len(rows)} rows.")
 
 
 def _backend_request(method: str, url: str, *, params=None, json_body=None) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -500,7 +563,7 @@ with tab_analyze:
                 st.bar_chart(df_chart.set_index("window")["hit_rate"])
                 st.bar_chart(df_chart.set_index("window")["avg_stat"])
             else:
-                st.dataframe(chart_rows, use_container_width=True)
+                _render_table(chart_rows)
 
             compare_rows = []
             for r in sorted(results, key=lambda x: float(x.get("confidence", 0)), reverse=True):
@@ -522,14 +585,14 @@ with tab_analyze:
                 )
 
             st.markdown("**Comparison Results**")
-            st.dataframe(_to_df(compare_rows), use_container_width=True)
+            _render_table(compare_rows)
 
     with st.expander("Local Session History"):
         if st.button("Clear History"):
             st.session_state["history"] = []
         history = st.session_state.get("history", [])
         if history:
-            st.dataframe(_to_df(history), use_container_width=True)
+            _render_table(history)
         else:
             st.write("No history yet.")
 
@@ -566,7 +629,7 @@ with tab_health:
         provider_mode = health.get("provider_mode", {})
         if provider_mode:
             st.markdown("**Provider Mode**")
-            st.dataframe(_to_df([provider_mode]), use_container_width=True)
+            _render_table([provider_mode])
 
         providers = []
         for name, state in (health.get("providers") or {}).items():
@@ -580,11 +643,11 @@ with tab_health:
                 }
             )
         st.markdown("**Providers**")
-        st.dataframe(_to_df(providers), use_container_width=True)
+        _render_table(providers)
 
         cache = health.get("cache") or {}
         st.markdown("**Cache**")
-        st.dataframe(_to_df([cache]), use_container_width=True)
+        _render_table([cache])
 
 with tab_perf:
     st.subheader("Performance")
@@ -609,7 +672,7 @@ with tab_perf:
             f.metric("Avg Confidence", f"{perf.get('avg_confidence', 0)}")
             g.metric("Sport", str(perf.get("sport", "all")).upper())
 
-            st.dataframe(_to_df([perf]), use_container_width=True)
+            _render_table([perf])
 
 with tab_picks:
     st.subheader("Recent Picks")
@@ -626,7 +689,7 @@ with tab_picks:
         else:
             items = picks_payload.get("items") or []
             st.metric("Returned", str(picks_payload.get("count", len(items))))
-            st.dataframe(_to_df(items), use_container_width=True)
+            _render_table(items)
 
             if items and pd is not None:
                 # Show quick confidence trend on most recent picks.
@@ -653,4 +716,4 @@ with tab_odds:
         else:
             rows = payload.get("rows") or []
             st.metric("Events", str(payload.get("count", len(rows))))
-            st.dataframe(_to_df(rows), use_container_width=True)
+            _render_table(rows)

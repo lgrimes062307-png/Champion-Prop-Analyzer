@@ -300,6 +300,29 @@ def _render_table(data: Any, *, max_rows: int = 300) -> None:
         st.caption(f"Showing {max_rows} of {len(rows)} rows.")
 
 
+def _render_bars(rows: List[Dict[str, Any]], label_key: str, value_key: str, color: str = "#2E86DE") -> None:
+    if not rows:
+        st.write("No chart data.")
+        return
+    for row in rows:
+        label = _cell_to_text(row.get(label_key, ""))
+        try:
+            raw_val = float(row.get(value_key, 0))
+        except Exception:
+            raw_val = 0.0
+        val = max(0.0, min(100.0, raw_val))
+        st.markdown(
+            (
+                "<div style='margin:8px 0;'>"
+                f"<div style='font-size:13px; margin-bottom:3px;'>{html.escape(label)}: {val:.1f}</div>"
+                "<div style='background:#edf1f6; border-radius:7px; overflow:hidden; height:12px;'>"
+                f"<div style='width:{val}%; background:{color}; height:12px;'></div>"
+                "</div></div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+
 def _backend_request(method: str, url: str, *, params=None, json_body=None) -> Tuple[Optional[Dict[str, Any]], str]:
     err = ""
     for attempt in range(BACKEND_RETRIES):
@@ -558,12 +581,19 @@ with tab_analyze:
                 {"window": "H2H", "hit_rate": float(best.get("h2h_hit_rate", 0)), "avg_stat": float(best.get("h2h_avg_stat", 0))},
             ]
             st.markdown("**Hit Rate by Window**")
-            df_chart = _to_df(chart_rows)
-            if pd is not None:
-                st.bar_chart(df_chart.set_index("window")["hit_rate"])
-                st.bar_chart(df_chart.set_index("window")["avg_stat"])
-            else:
-                _render_table(chart_rows)
+            _render_bars(chart_rows, "window", "hit_rate", color="#2E86DE")
+            st.markdown("**Average Stat by Window (scaled to line=100 max visual)**")
+            scaled_stat_rows = []
+            max_stat = max(1.0, max(float(r.get("avg_stat", 0) or 0) for r in chart_rows))
+            for row in chart_rows:
+                scaled_stat_rows.append(
+                    {
+                        "window": row["window"],
+                        "avg_stat_scaled": (float(row.get("avg_stat", 0) or 0) / max_stat) * 100.0,
+                        "avg_stat_raw": float(row.get("avg_stat", 0) or 0),
+                    }
+                )
+            _render_bars(scaled_stat_rows, "window", "avg_stat_scaled", color="#17A589")
 
             compare_rows = []
             for r in sorted(results, key=lambda x: float(x.get("confidence", 0)), reverse=True):
@@ -691,15 +721,22 @@ with tab_picks:
             st.metric("Returned", str(picks_payload.get("count", len(items))))
             _render_table(items)
 
-            if items and pd is not None:
-                # Show quick confidence trend on most recent picks.
-                trend = pd.DataFrame(items)
-                if "confidence" in trend.columns:
-                    trend = trend.sort_values("id")
-                    st.markdown("**Confidence Trend**")
-                    st.line_chart(trend.set_index("id")["confidence"])
-                if "fallback_used" in trend.columns:
-                    fallback_rate = round(100.0 * (trend["fallback_used"].astype(float).mean()), 2)
+            if items:
+                conf_vals = []
+                fb_vals = []
+                for row in items:
+                    try:
+                        conf_vals.append(float(row.get("confidence", 0) or 0))
+                    except Exception:
+                        pass
+                    try:
+                        fb_vals.append(1.0 if bool(row.get("fallback_used")) else 0.0)
+                    except Exception:
+                        pass
+                if conf_vals:
+                    st.metric("Avg Confidence (loaded picks)", f"{round(sum(conf_vals) / len(conf_vals), 2)}")
+                if fb_vals:
+                    fallback_rate = round(100.0 * (sum(fb_vals) / len(fb_vals)), 2)
                     st.metric("Fallback Rate", f"{fallback_rate}%")
 
 with tab_odds:

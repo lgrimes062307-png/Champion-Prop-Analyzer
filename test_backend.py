@@ -93,7 +93,41 @@ def test_collect_metric_series():
     assert vals == [310.0, 280.0]
 
 
+def test_collect_metric_series_does_not_double_count_row():
+    rows = [{"passingYards": "310", "passing_yards": 311, "opponent": "BAL"}]
+    vals = app._collect_metric_series(rows, ["passingYards", "passing_yards"])
+    assert vals == [310.0]
+
+
+def test_collect_from_espn_payload_keeps_values_aligned_to_opponent():
+    payload = {
+        "events": [
+            {"opponent": "BAL", "passingYards": "300", "gameDate": "2025-09-01"},
+            {"opponent": "KC", "passingYards": "250", "gameDate": "2025-09-08"},
+        ],
+        "seasonTotals": {"passingYards": "550"},
+    }
+    vals, h2h = app._collect_from_espn_payload(payload, ["passingYards"], "BAL")
+    assert vals == [300.0, 250.0]
+    assert h2h == [300.0]
+
+
 def test_implied_probability_from_american():
     assert app.implied_probability_from_american(-110) == 52.38
     assert app.implied_probability_from_american(120) == 45.45
 
+
+def test_collect_nba_from_espn_payload_points_and_combo():
+    payload = {
+        "events": [
+            {"opponent": "BOS", "points": 30, "rebounds": 8, "assists": 7, "minutes": 36, "gameDate": "2026-01-01"},
+            {"opponent": "NYK", "points": 22, "rebounds": 10, "assists": 9, "minutes": 35, "gameDate": "2026-01-03"},
+        ]
+    }
+    vals, h2h, usage = app._collect_nba_from_espn_payload(payload, "points", "BOS")
+    assert vals == [30.0, 22.0]
+    assert h2h == [30.0]
+    assert usage == [36.0, 35.0]
+
+    vals_combo, _, _ = app._collect_nba_from_espn_payload(payload, "pts+reb+ast", "")
+    assert vals_combo == [45.0, 41.0]

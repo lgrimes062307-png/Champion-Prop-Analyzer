@@ -748,6 +748,14 @@ def _season_label_to_year(season: str) -> int:
         return datetime.datetime.now().year
 
 
+def _season_label_to_end_year(season: str) -> int:
+    # "2024-25" => 2025
+    try:
+        return int(season.split("-")[0]) + 1
+    except Exception:
+        return datetime.datetime.now().year
+
+
 def _bdl_headers():
     headers = {
         "Accept": "application/json",
@@ -1171,7 +1179,8 @@ def _build_live_nba_result_from_espn(
         return None
 
     season = current_season()
-    season_year = _season_label_to_year(season)
+    # ESPN NBA gamelog season is keyed by season end-year (e.g. 2026 for 2025-26).
+    season_year = _season_label_to_end_year(season)
     athlete_id = _espn_find_player_id("basketball", "nba", player)
     if not athlete_id:
         return None
@@ -1206,6 +1215,7 @@ def _build_live_nba_result_from_espn(
 
     reasons = [
         "Live source: ESPN NBA game logs",
+        f"Season feed: {season_year}",
         f"L5/L10 hit rates: {l5_rate:.1f}% / {l10_rate:.1f}%",
         f"Expected {prop}: {expected_stat:.2f} vs line {line}",
         f"Opponent context: {opponent.upper() if opponent else 'none'} ({dvp})",
@@ -1264,6 +1274,8 @@ def _build_live_nba_result_from_espn(
         "data_source": "espn_nba",
         "fallback_used": False,
         "source_timestamp": _now_iso(),
+        "source_season": season,
+        "source_season_year": season_year,
         "model_version": MODEL_VERSION,
         "samples": {
             "last_5_games": l5_n,

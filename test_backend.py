@@ -41,6 +41,15 @@ def test_avg_stat():
     assert avg == round((5 + 8 + 11) / 3, 2)
 
 
+def test_nba_prop_game_details():
+    df = make_df()
+    rows = app.nba_prop_game_details(df, "points", 19.5, "gt", limit=3)
+    assert len(rows) == 3
+    assert rows[0]["opponent"] == "BOS"
+    assert rows[0]["prop_value"] == 20.0
+    assert rows[0]["hit"] is True
+
+
 def test_confidence():
     conf = app.confidence(55, 60, 50, 50, 50, 60, 40)
     assert conf in {70, 80, 90, 50}
@@ -124,10 +133,12 @@ def test_collect_nba_from_espn_payload_points_and_combo():
             {"opponent": "NYK", "points": 22, "rebounds": 10, "assists": 9, "minutes": 35, "gameDate": "2026-01-03"},
         ]
     }
-    vals, h2h, usage = app._collect_nba_from_espn_payload(payload, "points", "BOS")
+    vals, h2h, usage, details, h2h_details = app._collect_nba_from_espn_payload(payload, "points", "BOS")
     assert vals == [30.0, 22.0]
     assert h2h == [30.0]
     assert usage == [36.0, 35.0]
+    assert details[0]["opponent"] == "BOS"
+    assert h2h_details[0]["opponent"] == "BOS"
 
-    vals_combo, _, _ = app._collect_nba_from_espn_payload(payload, "pts+reb+ast", "")
+    vals_combo, _, _, _, _ = app._collect_nba_from_espn_payload(payload, "pts+reb+ast", "")
     assert vals_combo == [45.0, 41.0]

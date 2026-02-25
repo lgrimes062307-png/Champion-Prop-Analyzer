@@ -41,6 +41,11 @@ def test_avg_stat():
     assert avg == round((5 + 8 + 11) / 3, 2)
 
 
+def test_season_label_end_year():
+    assert app._season_label_to_end_year("2025-26") == 2026
+    assert app._season_label_to_end_year("2024-25") == 2025
+
+
 def test_nba_prop_game_details():
     df = make_df()
     rows = app.nba_prop_game_details(df, "points", 19.5, "gt", limit=3)
@@ -142,3 +147,4 @@ def test_collect_nba_from_espn_payload_points_and_combo():
 
     vals_combo, _, _, _, _ = app._collect_nba_from_espn_payload(payload, "pts+reb+ast", "")
     assert vals_combo == [45.0, 41.0]
+

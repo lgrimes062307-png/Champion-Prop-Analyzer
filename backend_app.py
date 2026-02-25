@@ -447,6 +447,39 @@ def stat_value(prop: str, g, sport: str = "nba"):
     return None
 
 
+def _nba_matchup_opponent(matchup: str) -> str:
+    text = str(matchup or "").strip()
+    if not text:
+        return ""
+    parts = text.split()
+    if not parts:
+        return ""
+    return parts[-1].upper()
+
+
+def nba_prop_game_details(df, prop: str, line: float, op: str, limit: int = 10):
+    rows = []
+    if df is None:
+        return rows
+    for _, g in df.head(max(1, int(limit))).iterrows():
+        val = stat_value(prop, g, "nba")
+        if val is None:
+            continue
+        valf = float(val)
+        matchup = str(g.get("MATCHUP", ""))
+        rows.append(
+            {
+                "date": str(g.get("GAME_DATE", "")),
+                "opponent": _nba_matchup_opponent(matchup),
+                "matchup": matchup,
+                "prop_value": round(valf, 2),
+                "line": float(line),
+                "hit": _compare(valf, float(line), op),
+            }
+        )
+    return rows
+
+
 def _compare(stat: float, line: float, op: str) -> bool:
     if op == "gte":
         return stat >= line
@@ -876,27 +909,42 @@ def _build_live_nba_result_from_bdl(
     prop_values: List[float] = []
     h2h_values: List[float] = []
     usage_values: List[float] = []
+    recent_details: List[dict] = []
+    h2h_details: List[dict] = []
     opp_target = opponent.strip().upper() if opponent else ""
 
     for row in stats_rows:
         v = _bdl_stat_for_prop(prop, row)
         if v is None:
             continue
-        prop_values.append(float(v))
-        usage_values.append(_extract_minutes_from_bdl(row.get("min")))
+        valf = float(v)
+        mins = _extract_minutes_from_bdl(row.get("min"))
+        prop_values.append(valf)
+        usage_values.append(mins)
+
+        game = row.get("game", {}) if isinstance(row.get("game"), dict) else {}
+        team = row.get("team", {}) if isinstance(row.get("team"), dict) else {}
+        home_id = game.get("home_team_id")
+        away_id = game.get("visitor_team_id")
+        player_team_id = team.get("id")
+        opp_abbrev = ""
+        if player_team_id is not None and home_id is not None and away_id is not None:
+            opp_id = away_id if int(player_team_id) == int(home_id) else home_id
+            opp_abbrev = str(teams_map.get(int(opp_id), "")).upper()
+        detail_row = {
+            "date": str(game.get("date", ""))[:10],
+            "opponent": opp_abbrev,
+            "prop_value": round(valf, 2),
+            "line": float(line),
+            "hit": _compare(valf, float(line), op),
+            "minutes": round(float(mins), 1),
+        }
+        recent_details.append(detail_row)
 
         if opp_target:
-            game = row.get("game", {}) if isinstance(row.get("game"), dict) else {}
-            home_id = game.get("home_team_id")
-            away_id = game.get("visitor_team_id")
-            team = row.get("team", {}) if isinstance(row.get("team"), dict) else {}
-            player_team_id = team.get("id")
-            opp_abbrev = ""
-            if player_team_id is not None and home_id is not None and away_id is not None:
-                opp_id = away_id if int(player_team_id) == int(home_id) else home_id
-                opp_abbrev = str(teams_map.get(int(opp_id), "")).upper()
             if opp_abbrev == opp_target:
-                h2h_values.append(float(v))
+                h2h_values.append(valf)
+                h2h_details.append(detail_row)
 
     if not prop_values:
         return None
@@ -963,6 +1011,8 @@ def _build_live_nba_result_from_bdl(
             "last_10_games": l10_n,
             "h2h_games": h2h_n,
         },
+        "last_games_detail": recent_details[:window_2],
+        "h2h_games_detail": h2h_details[:window_2],
     }
 
 
@@ -970,6 +1020,8 @@ def _collect_nba_from_espn_payload(payload, prop: str, opponent: str):
     values = []
     h2h_values = []
     usage_values = []
+    game_details = []
+    h2h_game_details = []
     opp_upper = opponent.strip().upper() if opponent else ""
     names = payload.get("names", []) if isinstance(payload, dict) else []
     idx_minutes = names.index("minutes") if "minutes" in names else None
@@ -1018,15 +1070,23 @@ def _collect_nba_from_espn_payload(payload, prop: str, opponent: str):
                 values.append(valf)
                 if mins is not None:
                     usage_values.append(float(mins))
+                event_id = str(event_entry.get("eventId", ""))
+                event_meta = event_map.get(event_id, {}) if isinstance(event_map, dict) else {}
+                opp_abbrev = str(((event_meta.get("opponent") or {}).get("abbreviation") or "")).upper()
+                detail_row = {
+                    "date": str(event_meta.get("gameDate", ""))[:10],
+                    "opponent": opp_abbrev,
+                    "prop_value": round(valf, 2),
+                    "minutes": round(float(mins), 1) if mins is not None else None,
+                }
+                game_details.append(detail_row)
                 if opp_upper:
-                    event_id = str(event_entry.get("eventId", ""))
-                    event_meta = event_map.get(event_id, {}) if isinstance(event_map, dict) else {}
-                    opp_abbrev = str(((event_meta.get("opponent") or {}).get("abbreviation") or "")).upper()
                     if opp_abbrev == opp_upper:
                         h2h_values.append(valf)
+                        h2h_game_details.append(detail_row)
 
     if values:
-        return values, h2h_values, usage_values
+        return values, h2h_values, usage_values, game_details, h2h_game_details
 
     # Fallback parser for older/different ESPN payloads.
     rows = _flatten_dict_for_metrics(payload)
@@ -1072,16 +1132,25 @@ def _collect_nba_from_espn_payload(payload, prop: str, opponent: str):
         values.append(valf)
         if mins is not None:
             usage_values.append(float(mins))
+        detail_row = {
+            "date": str(row.get("gameDate") or row.get("date") or ""),
+            "opponent": "",
+            "prop_value": round(valf, 2),
+            "minutes": round(float(mins), 1) if mins is not None else None,
+        }
         if opp_upper:
             row_opp = ""
             for k in opponent_keys:
                 if k in row and row[k]:
                     row_opp = str(row[k]).upper()
                     break
+            detail_row["opponent"] = row_opp
             if row_opp == opp_upper:
                 h2h_values.append(valf)
+                h2h_game_details.append(detail_row)
+        game_details.append(detail_row)
 
-    return values, h2h_values, usage_values
+    return values, h2h_values, usage_values, game_details, h2h_game_details
 
 
 def _build_live_nba_result_from_espn(
@@ -1108,7 +1177,7 @@ def _build_live_nba_result_from_espn(
         return None
 
     payload = _espn_gamelog_payload("basketball", "nba", athlete_id, season_year)
-    values, h2h_values, usage_values = _collect_nba_from_espn_payload(payload, prop, opponent)
+    values, h2h_values, usage_values, game_details, h2h_game_details = _collect_nba_from_espn_payload(payload, prop, opponent)
     if not values:
         return None
 
@@ -1142,6 +1211,33 @@ def _build_live_nba_result_from_espn(
         f"Opponent context: {opponent.upper() if opponent else 'none'} ({dvp})",
     ]
 
+    recent_details = []
+    for row in game_details[:window_2]:
+        valf = float(row.get("prop_value", 0.0))
+        recent_details.append(
+            {
+                "date": row.get("date", ""),
+                "opponent": row.get("opponent", ""),
+                "prop_value": round(valf, 2),
+                "line": float(line),
+                "hit": _compare(valf, float(line), op),
+                "minutes": row.get("minutes"),
+            }
+        )
+    h2h_details = []
+    for row in h2h_game_details[:window_2]:
+        valf = float(row.get("prop_value", 0.0))
+        h2h_details.append(
+            {
+                "date": row.get("date", ""),
+                "opponent": row.get("opponent", ""),
+                "prop_value": round(valf, 2),
+                "line": float(line),
+                "hit": _compare(valf, float(line), op),
+                "minutes": row.get("minutes"),
+            }
+        )
+
     return {
         "sport": "nba",
         "player": player,
@@ -1174,6 +1270,8 @@ def _build_live_nba_result_from_espn(
             "last_10_games": l10_n,
             "h2h_games": h2h_n,
         },
+        "last_games_detail": recent_details,
+        "h2h_games_detail": h2h_details,
     }
 
 
@@ -1579,6 +1677,8 @@ def _build_live_multi_sport_result(
             "last_10_games": l10_n,
             "h2h_games": h2h_n,
         },
+        "last_games_detail": [],
+        "h2h_games_detail": [],
     }
 
 
@@ -1678,6 +1778,8 @@ def build_multi_sport_fallback(
             "last_10_games": window_2,
             "h2h_games": h2h_n,
         },
+        "last_games_detail": [],
+        "h2h_games_detail": [],
     }
 
 
@@ -2340,6 +2442,8 @@ def evaluate(
     minutes_proj = round(float(last_2["MIN"].mean()), 1) if len(last_2) else 0
     dvp = get_team_def_rating(season, season_type, opponent)
     reasons = build_reasons(normalized_prop, line, l5, l10, h2h, avg_l5, avg_l10, avg_h2h, minutes_proj, dvp, opponent)
+    recent_details = nba_prop_game_details(last_2, normalized_prop, line, op, window_2)
+    h2h_details = nba_prop_game_details(h2h_df, normalized_prop, line, op, window_2) if opponent else []
 
     result = {
         "sport": normalized_sport,
@@ -2373,6 +2477,8 @@ def evaluate(
             "last_10_games": l10_n,
             "h2h_games": h2h_n,
         },
+        "last_games_detail": recent_details,
+        "h2h_games_detail": h2h_details,
     }
     implied_prob = implied_probability_from_american(offered_odds)
     edge_pct = round(result.get("projected_probability", 0.0) - implied_prob, 2) if implied_prob is not None else None

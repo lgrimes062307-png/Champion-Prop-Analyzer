@@ -575,6 +575,20 @@ with tab_analyze:
                     for reason in reasons:
                         st.write(f"- {reason}")
 
+            last_games_detail = best.get("last_games_detail") or []
+            h2h_games_detail = best.get("h2h_games_detail") or []
+            st.markdown("**Last Games (Prop Results)**")
+            if last_games_detail:
+                _render_table(last_games_detail, max_rows=20)
+            else:
+                st.caption("No per-game detail available for this result.")
+
+            st.markdown("**H2H Games (Prop Results)**")
+            if h2h_games_detail:
+                _render_table(h2h_games_detail, max_rows=20)
+            else:
+                st.caption("No H2H prop-game detail available for this matchup.")
+
             chart_rows = [
                 {"window": "Last 5", "hit_rate": float(best.get("last_5_hit_rate", 0)), "avg_stat": float(best.get("last_5_avg_stat", 0))},
                 {"window": "Last 10", "hit_rate": float(best.get("last_10_hit_rate", 0)), "avg_stat": float(best.get("last_10_avg_stat", 0))},

@@ -525,10 +525,11 @@ def avg_stat(df, prop: str, sport: str = "nba"):
 
 
 def confidence(l5: float, l10: float, h2h: float, l5_min: float, l10_min: float, h2h_good: float, low_max: float):
+    # Top confidence requires all three signals to agree.
+    if l5 >= l5_min and l10 >= l10_min and h2h >= h2h_good:
+        return 90
     if l5 >= l5_min and l10 >= l10_min:
         return 80
-    if h2h >= h2h_good:
-        return 90
     if l5 < low_max and l10 < low_max:
         return 50
     return 70
@@ -678,6 +679,17 @@ def projected_probability(l5: float, l10: float, h2h: float, has_h2h: bool):
         return 50.0
     value = ((h2h * h2h_w) + (l10 * l10_w) + (l5 * l5_w)) / total
     return round(max(1.0, min(99.0, value)), 2)
+
+
+def calibrate_confidence(conf: float, proj_prob: float, max_gap: float = 8.0) -> float:
+    # Keep confidence and projected probability aligned so UI signals do not conflict.
+    c = _safe_float(conf, 50.0)
+    p = _safe_float(proj_prob, 50.0)
+    blended = (0.25 * c) + (0.75 * p)
+    high = p + max_gap
+    low = p - max_gap
+    aligned = min(high, max(low, blended))
+    return round(max(1.0, min(99.0, aligned)), 2)
 
 
 def save_pick(
@@ -977,6 +989,7 @@ def _build_live_nba_result_from_bdl(
     expected_stat = weighted_expected_stat(avg_l5, avg_l10, avg_h2h, bool(h2h_vals))
     rec = line_recommendation(expected_stat, line)
     proj_prob = projected_probability(l5_rate, l10_rate, h2h_rate, bool(h2h_vals))
+    conf = calibrate_confidence(conf, proj_prob)
     minutes_proj = round(_mean(usage_values[:window_2]) if usage_values else 0.0, 1)
     dvp = get_team_def_rating(season, season_type, opponent)
 
@@ -1210,6 +1223,7 @@ def _build_live_nba_result_from_espn(
     expected_stat = weighted_expected_stat(avg_l5, avg_l10, avg_h2h, bool(h2h_vals))
     rec = line_recommendation(expected_stat, line)
     proj_prob = projected_probability(l5_rate, l10_rate, h2h_rate, bool(h2h_vals))
+    conf = calibrate_confidence(conf, proj_prob)
     minutes_proj = round(_mean(usage_values[:window_2]) if usage_values else _mean(last_10_vals), 1)
     dvp = get_team_def_rating(season, season_type, opponent)
 
@@ -1637,6 +1651,7 @@ def _build_live_multi_sport_result(
     expected_stat = weighted_expected_stat(avg_l5, avg_l10, avg_h2h, bool(h2h_vals))
     rec = line_recommendation(expected_stat, line)
     proj_prob = projected_probability(l5_rate, l10_rate, h2h_rate, bool(h2h_vals))
+    conf = calibrate_confidence(conf, proj_prob)
     minutes_proj = round(_mean(usage_values) if usage_values else _mean(last_10_vals), 1)
     projection_label = {
         "mlb": "Plate Appearances",
@@ -1734,6 +1749,7 @@ def build_multi_sport_fallback(
     expected_stat = weighted_expected_stat(last_5_avg_stat, last_10_avg_stat, h2h_avg_stat, bool(h2h_n))
     rec = line_recommendation(expected_stat, line)
     proj_prob = projected_probability(last_5_hit_rate, last_10_hit_rate, h2h_hit_rate, bool(h2h_n))
+    conf = calibrate_confidence(conf, proj_prob)
 
     projection_label = {
         "mlb": "Plate Appearances",
@@ -2451,6 +2467,7 @@ def evaluate(
     expected_stat = weighted_expected_stat(avg_l5, avg_l10, avg_h2h, has_h2h)
     rec = line_recommendation(expected_stat, line)
     proj_prob = projected_probability(l5, l10, h2h, has_h2h)
+    conf = calibrate_confidence(conf, proj_prob)
     minutes_proj = round(float(last_2["MIN"].mean()), 1) if len(last_2) else 0
     dvp = get_team_def_rating(season, season_type, opponent)
     reasons = build_reasons(normalized_prop, line, l5, l10, h2h, avg_l5, avg_l10, avg_h2h, minutes_proj, dvp, opponent)

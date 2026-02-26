@@ -56,8 +56,17 @@ def test_nba_prop_game_details():
 
 
 def test_confidence():
-    conf = app.confidence(55, 60, 50, 50, 50, 60, 40)
-    assert conf in {70, 80, 90, 50}
+    # 90 only when all three (L5, L10, H2H) pass thresholds.
+    assert app.confidence(55, 60, 65, 50, 50, 60, 40) == 90
+    assert app.confidence(55, 60, 50, 50, 50, 60, 40) == 80
+    assert app.confidence(35, 38, 70, 50, 50, 60, 40) == 50
+
+
+def test_calibrate_confidence_aligns_to_projected_prob():
+    aligned = app.calibrate_confidence(90, 56)
+    assert 48 <= aligned <= 64
+    aligned2 = app.calibrate_confidence(50, 82)
+    assert 74 <= aligned2 <= 90
 
 
 def test_sport_and_prop_normalization():
@@ -147,4 +156,3 @@ def test_collect_nba_from_espn_payload_points_and_combo():
 
     vals_combo, _, _, _, _ = app._collect_nba_from_espn_payload(payload, "pts+reb+ast", "")
     assert vals_combo == [45.0, 41.0]
-

@@ -72,9 +72,26 @@ def test_calibrate_confidence_aligns_to_projected_prob():
 def test_sport_and_prop_normalization():
     assert app.normalize_sport("basketball") == "nba"
     assert app.normalize_sport("hockey") == "nhl"
+    assert app.normalize_sport("counter-strike") == "cs2"
+    assert app.normalize_sport("call of duty") == "cod"
     assert app.normalize_prop("pts", "nba") == "points"
     assert app.normalize_prop("hr", "mlb") == "home_runs"
     assert app.normalize_prop("rec_yds", "nfl") == "receiving_yards"
+    assert app.normalize_prop("kd_ratio", "cs2") == "kd_ratio"
+
+
+def test_pandascore_game_slug_mapping():
+    assert app._pandascore_game_slug("cs2") == "csgo"
+    assert app._pandascore_game_slug("cod") == app.PANDASCORE_COD_GAME
+    assert app._pandascore_game_slug("nba") == ""
+
+
+def test_esports_metric_map_has_core_fields():
+    cs2_map = app._sport_metric_map("cs2")
+    cod_map = app._sport_metric_map("cod")
+    assert "kills" in cs2_map
+    assert "kd_ratio" in cs2_map
+    assert "objective_kills" in cod_map
 
 
 def test_multi_sport_fallback_shape():

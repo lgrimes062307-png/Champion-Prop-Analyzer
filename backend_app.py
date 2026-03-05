@@ -50,7 +50,7 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 DB_PATH = os.getenv("DB_PATH", "app.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 
-SUPPORTED_SPORTS = ("nba", "mlb", "nfl", "soccer", "nhl")
+SUPPORTED_SPORTS = ("nba", "mlb", "nfl", "soccer", "nhl", "tennis", "golf", "cs2", "cod")
 SPORT_ALIASES = {
     "nba": "nba",
     "basketball": "nba",
@@ -63,6 +63,16 @@ SPORT_ALIASES = {
     "football-soccer": "soccer",
     "nhl": "nhl",
     "hockey": "nhl",
+    "tennis": "tennis",
+    "golf": "golf",
+    "cs2": "cs2",
+    "counterstrike": "cs2",
+    "counter-strike": "cs2",
+    "counter strike": "cs2",
+    "cod": "cod",
+    "callofduty": "cod",
+    "call-of-duty": "cod",
+    "call of duty": "cod",
 }
 
 PROP_ALIASES_BY_SPORT = {
@@ -123,6 +133,36 @@ PROP_ALIASES_BY_SPORT = {
         "shots": "shots",
         "saves": "saves",
     },
+    "tennis": {
+        "aces": "aces",
+        "double_faults": "double_faults",
+        "first_serve_pct": "first_serve_pct",
+        "break_points_won": "break_points_won",
+        "games_won": "games_won",
+    },
+    "golf": {
+        "birdies": "birdies",
+        "bogeys": "bogeys",
+        "pars": "pars",
+        "fairways_hit": "fairways_hit",
+        "greens_in_regulation": "greens_in_regulation",
+    },
+    "cs2": {
+        "kills": "kills",
+        "deaths": "deaths",
+        "assists": "assists",
+        "headshots": "headshots",
+        "kd_ratio": "kd_ratio",
+        "map_wins": "map_wins",
+    },
+    "cod": {
+        "kills": "kills",
+        "deaths": "deaths",
+        "assists": "assists",
+        "kd_ratio": "kd_ratio",
+        "objective_kills": "objective_kills",
+        "map_wins": "map_wins",
+    },
 }
 
 NON_NBA_DVP_MAPS = {
@@ -154,6 +194,30 @@ NON_NBA_DVP_MAPS = {
         "COL": "Weak",
         "VGK": "Average",
     },
+    "tennis": {
+        "DJOKOVIC": "Strong",
+        "ALCARAZ": "Strong",
+        "SINNER": "Average",
+        "MEDVEDEV": "Average",
+    },
+    "golf": {
+        "SCHEFFLER": "Strong",
+        "MCILROY": "Average",
+        "RAHM": "Average",
+        "SCHAUFFELE": "Weak",
+    },
+    "cs2": {
+        "NAVI": "Strong",
+        "FAZE": "Strong",
+        "G2": "Average",
+        "VITALITY": "Average",
+    },
+    "cod": {
+        "FAZE": "Strong",
+        "OPTIC": "Average",
+        "ULTRA": "Average",
+        "SURGE": "Weak",
+    },
 }
 
 # ---------------- HELPERS ---------------- #
@@ -176,10 +240,21 @@ BALDONTLIE_ENABLED = os.getenv("BALDONTLIE_ENABLED", "false").strip().lower() in
 BALDONTLIE_HTTP_TIMEOUT_SECONDS = float(os.getenv("BALDONTLIE_HTTP_TIMEOUT_SECONDS", "10"))
 BALDONTLIE_HTTP_RETRIES = int(os.getenv("BALDONTLIE_HTTP_RETRIES", "2"))
 BALDONTLIE_RETRY_BACKOFF_SECONDS = float(os.getenv("BALDONTLIE_RETRY_BACKOFF_SECONDS", "0.3"))
+PANDASCORE_API_BASE_URL = os.getenv("PANDASCORE_API_BASE_URL", "https://api.pandascore.co")
+PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "").strip()
+PANDASCORE_ENABLED = os.getenv("PANDASCORE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+PANDASCORE_HTTP_TIMEOUT_SECONDS = float(os.getenv("PANDASCORE_HTTP_TIMEOUT_SECONDS", "10"))
+PANDASCORE_HTTP_RETRIES = int(os.getenv("PANDASCORE_HTTP_RETRIES", "2"))
+PANDASCORE_RETRY_BACKOFF_SECONDS = float(os.getenv("PANDASCORE_RETRY_BACKOFF_SECONDS", "0.3"))
+PANDASCORE_COD_GAME = os.getenv("PANDASCORE_COD_GAME", "codmw").strip().lower()
 NFL_SEASON_YEAR = int(os.getenv("NFL_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_SEASON_YEAR = int(os.getenv("SOCCER_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_LEAGUE = os.getenv("SOCCER_LEAGUE", "eng.1")
 SOCCER_TEAM = os.getenv("SOCCER_TEAM", "")
+TENNIS_SEASON_YEAR = int(os.getenv("TENNIS_SEASON_YEAR", str(datetime.datetime.now().year)))
+TENNIS_LEAGUE = os.getenv("TENNIS_LEAGUE", "atp")
+GOLF_SEASON_YEAR = int(os.getenv("GOLF_SEASON_YEAR", str(datetime.datetime.now().year)))
+GOLF_LEAGUE = os.getenv("GOLF_LEAGUE", "pga")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "2026.02.multi.v1")
 APP_BUILD = os.getenv("APP_BUILD", "2026-02-20.r1")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
@@ -206,6 +281,7 @@ _provider_lock = threading.Lock()
 _provider_fail_threshold = int(os.getenv("PROVIDER_FAIL_THRESHOLD", "4"))
 _provider_cooldown_seconds = int(os.getenv("PROVIDER_COOLDOWN_SECONDS", "120"))
 _balldontlie_runtime_disabled_reason = ""
+_pandascore_runtime_disabled_reason = ""
 
 
 class AnalyzeRequestV2(BaseModel):
@@ -301,6 +377,8 @@ def _provider_name_from_url(url: str):
         return "espn"
     if "balldontlie.io" in url:
         return "balldontlie"
+    if "pandascore.co" in url:
+        return "pandascore"
     if "the-odds-api.com" in url:
         return "odds_api"
     if "discord.com" in url:
@@ -316,8 +394,18 @@ def _balldontlie_is_enabled() -> bool:
     return not bool(_balldontlie_runtime_disabled_reason)
 
 
+def _pandascore_is_enabled() -> bool:
+    if not PANDASCORE_ENABLED:
+        return False
+    if not PANDASCORE_API_KEY:
+        return False
+    return not bool(_pandascore_runtime_disabled_reason)
+
+
 def _provider_is_open(provider: str):
     if provider == "balldontlie" and not _balldontlie_is_enabled():
+        return False
+    if provider == "pandascore" and not _pandascore_is_enabled():
         return False
     with _provider_lock:
         state = _provider_state.get(provider, {})
@@ -807,6 +895,330 @@ def _bdl_fetch_json(path: str, params: Optional[dict] = None):
             if attempt < retries - 1:
                 time.sleep(BALDONTLIE_RETRY_BACKOFF_SECONDS * (attempt + 1))
     raise HTTPException(status_code=502, detail=f"Provider request failed ({provider}): {last_exc}")
+
+
+def _pandascore_headers():
+    return {
+        "Accept": "application/json",
+        "User-Agent": "prop-analyzer/1.0",
+        "Authorization": f"Bearer {PANDASCORE_API_KEY}",
+    }
+
+
+def _pandascore_fetch_json(path: str, params: Optional[dict] = None):
+    global _pandascore_runtime_disabled_reason
+    if not _pandascore_is_enabled():
+        raise HTTPException(status_code=503, detail="Provider pandascore is disabled")
+    base = PANDASCORE_API_BASE_URL.rstrip("/")
+    url = f"{base}/{path.lstrip('/')}"
+    provider = _provider_name_from_url(url)
+    if _provider_is_open(provider):
+        raise HTTPException(status_code=503, detail=f"Provider {provider} is temporarily unavailable")
+
+    last_exc = None
+    retries = max(1, PANDASCORE_HTTP_RETRIES)
+    timeout = max(1.0, PANDASCORE_HTTP_TIMEOUT_SECONDS)
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params or {}, headers=_pandascore_headers(), timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+            _provider_note_success(provider)
+            return payload
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code in (401, 403):
+                _pandascore_runtime_disabled_reason = f"auth_error_{status_code}"
+            last_exc = exc
+            _provider_note_failure(provider, f"{type(exc).__name__}: {exc}")
+            if attempt < retries - 1:
+                time.sleep(PANDASCORE_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    raise HTTPException(status_code=502, detail=f"Provider request failed ({provider}): {last_exc}")
+
+
+def _pandascore_game_slug(sport: str) -> str:
+    if sport == "cs2":
+        return "csgo"
+    if sport == "cod":
+        return PANDASCORE_COD_GAME or "codmw"
+    return ""
+
+
+def _pandascore_rows(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+    return []
+
+
+def _pandascore_find_player(game_slug: str, player: str):
+    cache_key = ("pandascore_player", game_slug, player.lower().strip())
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached
+    if not game_slug:
+        return None
+
+    candidate_queries = [
+        {"search[name]": player, "page[size]": 50},
+        {"filter[name]": player, "page[size]": 50},
+        {"search": player, "page[size]": 50},
+    ]
+    rows = []
+    for params in candidate_queries:
+        try:
+            payload = _pandascore_fetch_json(f"/{game_slug}/players", params=params)
+            rows = _pandascore_rows(payload)
+            if rows:
+                break
+        except HTTPException as exc:
+            # Keep trying alternate query styles unless auth/provider is down.
+            if exc.status_code in (401, 403, 503):
+                raise
+            continue
+
+    if not rows:
+        _set_cached_external(cache_key, None)
+        return None
+
+    needle = player.strip().lower()
+    selected = None
+    for row in rows:
+        name = str(row.get("name") or row.get("slug") or "").strip().lower()
+        if name == needle:
+            selected = row
+            break
+    if selected is None:
+        selected = rows[0]
+    _set_cached_external(cache_key, selected)
+    return selected
+
+
+def _pandascore_player_matches(game_slug: str, player_id: int, player: str):
+    cache_key = ("pandascore_matches", game_slug, int(player_id))
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached
+
+    query_candidates = [
+        (f"/{game_slug}/players/{player_id}/matches", {"page[size]": 50}),
+        (f"/{game_slug}/matches", {"filter[player_id]": player_id, "page[size]": 50}),
+        (f"/{game_slug}/matches/past", {"filter[player_id]": player_id, "page[size]": 50}),
+        (f"/{game_slug}/matches/past", {"search": player, "page[size]": 50}),
+    ]
+    rows = []
+    for path, params in query_candidates:
+        try:
+            payload = _pandascore_fetch_json(path, params=params)
+            rows = _pandascore_rows(payload)
+            if rows:
+                break
+        except HTTPException as exc:
+            if exc.status_code in (401, 403, 503):
+                raise
+            continue
+    _set_cached_external(cache_key, rows)
+    return rows
+
+
+def _pandascore_collect_from_matches(game_slug: str, player_id: int, player: str, prop: str, opponent: str):
+    matches = _pandascore_player_matches(game_slug, player_id, player)
+    if not matches:
+        return [], [], [], [], []
+
+    metric_candidates = _sport_metric_map("cs2" if game_slug == "csgo" else "cod").get(prop, [prop])
+    opp_upper = opponent.strip().upper() if opponent else ""
+    values = []
+    h2h_values = []
+    usage_values = []
+    details = []
+    h2h_details = []
+    needle = player.strip().lower()
+
+    def _match_sort_key(row):
+        return str(row.get("begin_at") or row.get("scheduled_at") or "")
+
+    for match in sorted(matches, key=_match_sort_key, reverse=True):
+        rows = _flatten_dict_for_metrics(match)
+        relevant_rows = []
+        for row in rows:
+            pid = row.get("player_id")
+            rid = row.get("id")
+            rname = str(row.get("name") or row.get("slug") or "").strip().lower()
+            match_player = False
+            if pid is not None and str(pid) == str(player_id):
+                match_player = True
+            elif rid is not None and str(rid) == str(player_id):
+                match_player = True
+            elif rname and (rname == needle or needle in rname):
+                match_player = True
+            if match_player:
+                relevant_rows.append(row)
+        if not relevant_rows:
+            relevant_rows = rows
+
+        vals = _collect_metric_series(relevant_rows, metric_candidates)
+        if not vals:
+            # Try derived metrics for ratios.
+            if prop == "kd_ratio":
+                kills = _collect_metric_series(relevant_rows, ["kills"])
+                deaths = _collect_metric_series(relevant_rows, ["deaths"])
+                if kills and deaths and deaths[0] > 0:
+                    vals = [round(kills[0] / deaths[0], 3)]
+        if not vals:
+            continue
+
+        val = float(vals[0])
+        values.append(val)
+
+        opps = []
+        for block in match.get("opponents", []) if isinstance(match.get("opponents"), list) else []:
+            opp = block.get("opponent") if isinstance(block, dict) else {}
+            if isinstance(opp, dict):
+                name = str(opp.get("acronym") or opp.get("name") or opp.get("slug") or "").upper()
+                if name:
+                    opps.append(name)
+        opponent_label = " vs ".join(opps[:2]) if opps else str(match.get("name") or "")
+        detail = {
+            "date": str(match.get("begin_at") or match.get("scheduled_at") or "")[:10],
+            "opponent": opponent_label,
+            "prop_value": round(val, 2),
+            "line": None,
+            "hit": None,
+        }
+        details.append(detail)
+        if opp_upper:
+            hay = f"{opponent_label} {str(match)}".upper()
+            if opp_upper in hay:
+                h2h_values.append(val)
+                h2h_details.append(detail)
+
+    return values, h2h_values, usage_values, details, h2h_details
+
+
+def _build_live_esports_result_from_pandascore(
+    sport: str,
+    player: str,
+    prop: str,
+    line: float,
+    opponent: str,
+    window_1: int,
+    window_2: int,
+    op: str,
+    conf_l5_min: float,
+    conf_l10_min: float,
+    conf_h2h_good: float,
+    conf_low_max: float,
+):
+    if not _pandascore_is_enabled():
+        return None
+    game_slug = _pandascore_game_slug(sport)
+    if not game_slug:
+        return None
+    player_item = _pandascore_find_player(game_slug, player)
+    if not player_item:
+        return None
+    player_id = player_item.get("id")
+    if player_id is None:
+        return None
+
+    prop_values, h2h_values, usage_values, details, h2h_details = _pandascore_collect_from_matches(
+        game_slug, int(player_id), player, prop, opponent
+    )
+    if not prop_values:
+        return None
+
+    last_5_vals = prop_values[:window_1]
+    last_10_vals = prop_values[:window_2]
+    h2h_vals = h2h_values[:window_2]
+    l5_hits, l5_n, l5_rate, l5_ci = _ci_from_values(last_5_vals, line, op)
+    l10_hits, l10_n, l10_rate, l10_ci = _ci_from_values(last_10_vals, line, op)
+    if h2h_vals:
+        h2h_hits, h2h_n, h2h_rate, h2h_ci = _ci_from_values(h2h_vals, line, op)
+    else:
+        h2h_hits, h2h_n = 0, 0
+        h2h_rate = DEFAULT_H2H_WITH_OPP if opponent else DEFAULT_H2H
+        h2h_ci = (0.0, 0.0)
+
+    avg_l5 = _mean(last_5_vals)
+    avg_l10 = _mean(last_10_vals)
+    avg_h2h = _mean(h2h_vals) if h2h_vals else 0.0
+    conf = confidence(l5_rate, l10_rate, h2h_rate, conf_l5_min, conf_l10_min, conf_h2h_good, conf_low_max)
+    expected_stat = weighted_expected_stat(avg_l5, avg_l10, avg_h2h, bool(h2h_vals))
+    rec = line_recommendation(expected_stat, line)
+    proj_prob = projected_probability(l5_rate, l10_rate, h2h_rate, bool(h2h_vals))
+    conf = calibrate_confidence(conf, proj_prob)
+    projection_label = "Map Projection"
+    dvp = NON_NBA_DVP_MAPS.get(sport, {}).get(opponent.strip().upper(), "Average") if opponent else "N/A"
+    reasons = [
+        "Live source: PandaScore esports matches",
+        f"L5/L10 hit rates: {l5_rate:.1f}% / {l10_rate:.1f}%",
+        f"Expected {prop}: {expected_stat:.2f} vs line {line}",
+        f"Opponent context: {opponent.upper() if opponent else 'none'} ({dvp})",
+    ]
+    detailed = []
+    for row in details[:window_2]:
+        val = float(row.get("prop_value", 0.0))
+        detailed.append(
+            {
+                "date": row.get("date", ""),
+                "opponent": row.get("opponent", ""),
+                "prop_value": round(val, 2),
+                "line": float(line),
+                "hit": _compare(val, float(line), op),
+            }
+        )
+    h2h_detailed = []
+    for row in h2h_details[:window_2]:
+        val = float(row.get("prop_value", 0.0))
+        h2h_detailed.append(
+            {
+                "date": row.get("date", ""),
+                "opponent": row.get("opponent", ""),
+                "prop_value": round(val, 2),
+                "line": float(line),
+                "hit": _compare(val, float(line), op),
+            }
+        )
+
+    return {
+        "sport": sport,
+        "player": player,
+        "prop": prop,
+        "line": line,
+        "last_5_hit_rate": l5_rate,
+        "last_10_hit_rate": l10_rate,
+        "h2h_hit_rate": h2h_rate,
+        "last_5_ci": l5_ci,
+        "last_10_ci": l10_ci,
+        "h2h_ci": h2h_ci,
+        "last_5_avg_stat": avg_l5,
+        "last_10_avg_stat": avg_l10,
+        "h2h_avg_stat": avg_h2h,
+        "confidence": conf,
+        "projected_probability": proj_prob,
+        "recommendation": rec,
+        "confidence_label": recommendation(conf),
+        "expected_stat": expected_stat,
+        "minutes_proj": 0.0,
+        "projection_label": projection_label,
+        "dvp": dvp,
+        "reasons": reasons,
+        "data_source": "pandascore",
+        "fallback_used": False,
+        "source_timestamp": _now_iso(),
+        "model_version": MODEL_VERSION,
+        "samples": {
+            "last_5_games": l5_n,
+            "last_10_games": l10_n,
+            "h2h_games": h2h_n,
+        },
+        "last_games_detail": detailed,
+        "h2h_games_detail": h2h_detailed,
+    }
 
 
 def _extract_minutes_from_bdl(val) -> float:
@@ -1491,6 +1903,40 @@ def _sport_metric_map(sport: str) -> dict:
             "shots": ["shots", "shotsOnGoal"],
             "saves": ["saves"],
         }
+    if sport == "tennis":
+        return {
+            "aces": ["aces"],
+            "double_faults": ["doubleFaults", "double_faults"],
+            "first_serve_pct": ["firstServePct", "firstServePercentage", "firstServePercent"],
+            "break_points_won": ["breakPointsWon", "break_points_won"],
+            "games_won": ["gamesWon", "games_won"],
+        }
+    if sport == "golf":
+        return {
+            "birdies": ["birdies"],
+            "bogeys": ["bogeys"],
+            "pars": ["pars"],
+            "fairways_hit": ["fairwaysHit", "fairways_hit"],
+            "greens_in_regulation": ["greensInRegulation", "greens_in_regulation", "gir"],
+        }
+    if sport == "cs2":
+        return {
+            "kills": ["kills", "kill"],
+            "deaths": ["deaths", "death"],
+            "assists": ["assists", "assist"],
+            "headshots": ["headshots", "headshot_kills", "hs"],
+            "kd_ratio": ["kd", "kdr", "kd_ratio"],
+            "map_wins": ["map_wins", "maps_won", "wins"],
+        }
+    if sport == "cod":
+        return {
+            "kills": ["kills", "kill"],
+            "deaths": ["deaths", "death"],
+            "assists": ["assists", "assist"],
+            "kd_ratio": ["kd", "kdr", "kd_ratio"],
+            "objective_kills": ["objective_kills", "objectiveKills", "obj_kills"],
+            "map_wins": ["map_wins", "maps_won", "wins"],
+        }
     return {}
 
 
@@ -1560,7 +2006,11 @@ def get_injury_context(sport: str, player: str):
         "nfl": ("football", "nfl"),
         "soccer": ("soccer", SOCCER_LEAGUE if "." in SOCCER_LEAGUE else "eng.1"),
         "nhl": ("hockey", "nhl"),
+        "tennis": ("tennis", TENNIS_LEAGUE),
+        "golf": ("golf", GOLF_LEAGUE),
         "mlb": None,
+        "cs2": None,
+        "cod": None,
     }
     league = league_map.get(sport)
     if league is None:
@@ -1627,6 +2077,42 @@ def _build_live_multi_sport_result(
         if athlete_id:
             payload = _espn_gamelog_payload("hockey", "nhl", athlete_id, season_year)
             prop_values, h2h_values = _collect_from_espn_payload(payload, _sport_metric_map("nhl").get(prop, []), opponent)
+    elif sport == "tennis":
+        league_path = TENNIS_LEAGUE or "atp"
+        athlete_id = _espn_find_player_id("tennis", league_path, player)
+        if athlete_id:
+            payload = _espn_gamelog_payload("tennis", league_path, athlete_id, TENNIS_SEASON_YEAR)
+            prop_values, h2h_values = _collect_from_espn_payload(payload, _sport_metric_map("tennis").get(prop, []), opponent)
+            if not opponent:
+                dvp = f"Tour: {league_path.upper()}"
+    elif sport == "golf":
+        league_path = GOLF_LEAGUE or "pga"
+        athlete_id = _espn_find_player_id("golf", league_path, player)
+        if athlete_id:
+            payload = _espn_gamelog_payload("golf", league_path, athlete_id, GOLF_SEASON_YEAR)
+            prop_values, h2h_values = _collect_from_espn_payload(payload, _sport_metric_map("golf").get(prop, []), opponent)
+            if not opponent:
+                dvp = f"Tour: {league_path.upper()}"
+    elif sport in ("cs2", "cod"):
+        esports_result = _build_live_esports_result_from_pandascore(
+            sport=sport,
+            player=player,
+            prop=prop,
+            line=line,
+            opponent=opponent,
+            window_1=window_1,
+            window_2=window_2,
+            op=op,
+            conf_l5_min=conf_l5_min,
+            conf_l10_min=conf_l10_min,
+            conf_h2h_good=conf_h2h_good,
+            conf_low_max=conf_low_max,
+        )
+        if esports_result:
+            return esports_result
+        if not _pandascore_is_enabled():
+            reason = _pandascore_runtime_disabled_reason or "disabled_or_missing_key"
+            raise HTTPException(status_code=503, detail=f"PandaScore provider unavailable: {reason}")
 
     if not prop_values:
         return None
@@ -1658,6 +2144,10 @@ def _build_live_multi_sport_result(
         "nfl": "Usage Projection",
         "soccer": "Minutes Projection",
         "nhl": "TOI Projection",
+        "tennis": "Set Projection",
+        "golf": "Round Projection",
+        "cs2": "Map Projection",
+        "cod": "Map Projection",
     }.get(sport, "Projection")
 
     if not opponent:
@@ -1723,9 +2213,36 @@ def build_multi_sport_fallback(
     conf_low_max: float,
 ):
     rng = _deterministic_rng(sport, player, prop, line, opponent, window_1, window_2)
-    base_rate = {"mlb": 51.0, "nfl": 54.0, "soccer": 49.0, "nhl": 50.0}.get(sport, 50.0)
-    spread = {"mlb": 18.0, "nfl": 14.0, "soccer": 17.0, "nhl": 16.0}.get(sport, 15.0)
-    stat_spread = {"mlb": 1.6, "nfl": 18.0, "soccer": 1.2, "nhl": 1.4}.get(sport, 1.5)
+    base_rate = {
+        "mlb": 51.0,
+        "nfl": 54.0,
+        "soccer": 49.0,
+        "nhl": 50.0,
+        "tennis": 52.0,
+        "golf": 50.0,
+        "cs2": 53.0,
+        "cod": 52.0,
+    }.get(sport, 50.0)
+    spread = {
+        "mlb": 18.0,
+        "nfl": 14.0,
+        "soccer": 17.0,
+        "nhl": 16.0,
+        "tennis": 13.0,
+        "golf": 15.0,
+        "cs2": 14.0,
+        "cod": 14.0,
+    }.get(sport, 15.0)
+    stat_spread = {
+        "mlb": 1.6,
+        "nfl": 18.0,
+        "soccer": 1.2,
+        "nhl": 1.4,
+        "tennis": 2.4,
+        "golf": 1.8,
+        "cs2": 6.0,
+        "cod": 6.0,
+    }.get(sport, 1.5)
 
     last_5_hit_rate = round(max(5.0, min(95.0, base_rate + rng.uniform(-spread, spread))), 2)
     last_10_hit_rate = round(max(5.0, min(95.0, base_rate + rng.uniform(-spread, spread))), 2)
@@ -1756,12 +2273,20 @@ def build_multi_sport_fallback(
         "nfl": "Usage Projection",
         "soccer": "Minutes Projection",
         "nhl": "TOI Projection",
+        "tennis": "Set Projection",
+        "golf": "Round Projection",
+        "cs2": "Map Projection",
+        "cod": "Map Projection",
     }.get(sport, "Projection")
     projection_range = {
         "mlb": (3.5, 5.0),
         "nfl": (40.0, 85.0),
         "soccer": (70.0, 95.0),
         "nhl": (13.0, 24.0),
+        "tennis": (2.0, 3.0),
+        "golf": (1.0, 4.0),
+        "cs2": (1.0, 3.0),
+        "cod": (1.0, 3.0),
     }.get(sport, (0.0, 0.0))
     minutes_proj = round(rng.uniform(projection_range[0], projection_range[1]), 1)
 
@@ -2825,6 +3350,10 @@ def health():
             "balldontlie_config_enabled": BALDONTLIE_ENABLED,
             "balldontlie_has_key": bool(BALDONTLIE_API_KEY),
             "balldontlie_runtime_disabled_reason": _balldontlie_runtime_disabled_reason,
+            "pandascore_enabled": _pandascore_is_enabled(),
+            "pandascore_config_enabled": PANDASCORE_ENABLED,
+            "pandascore_has_key": bool(PANDASCORE_API_KEY),
+            "pandascore_runtime_disabled_reason": _pandascore_runtime_disabled_reason,
             "nba_espn_fallback_enabled": NBA_ESPN_FALLBACK_ENABLED,
         },
         "providers": providers,
@@ -2838,6 +3367,7 @@ def health():
 
 @app.post("/admin/reset-runtime")
 def admin_reset_runtime(admin_secret: str = Query(..., min_length=1)):
+    global _balldontlie_runtime_disabled_reason, _pandascore_runtime_disabled_reason
     if not ADMIN_SECRET or admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized.")
     with _provider_lock:
@@ -2852,6 +3382,8 @@ def admin_reset_runtime(admin_secret: str = Query(..., min_length=1)):
     _external_cache.clear()
     _player_log_cache.clear()
     _team_stats_cache.clear()
+    _balldontlie_runtime_disabled_reason = ""
+    _pandascore_runtime_disabled_reason = ""
     return {
         "ok": True,
         "reset_at": _now_iso(),

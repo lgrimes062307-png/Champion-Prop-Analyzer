@@ -61,7 +61,7 @@ DEFAULT_PRESETS = {
     },
 }
 
-SPORT_OPTIONS = ["nba", "mlb", "nfl", "soccer", "nhl"]
+SPORT_OPTIONS = ["nba", "mlb", "nfl", "soccer", "nhl", "tennis", "golf", "cs2", "cod"]
 NBA_TEAMS = [
     "",
     "ATL",
@@ -101,6 +101,10 @@ PROP_OPTIONS_BY_SPORT = {
     "nfl": ["passing_yards", "rushing_yards", "receiving_yards", "receptions", "touchdowns"],
     "soccer": ["goals", "assists", "shots", "shots_on_target", "passes"],
     "nhl": ["goals", "assists", "points", "shots", "saves"],
+    "tennis": ["aces", "double_faults", "first_serve_pct", "break_points_won", "games_won"],
+    "golf": ["birdies", "bogeys", "pars", "fairways_hit", "greens_in_regulation"],
+    "cs2": ["kills", "deaths", "assists", "headshots", "kd_ratio", "map_wins"],
+    "cod": ["kills", "deaths", "assists", "kd_ratio", "objective_kills", "map_wins"],
 }
 OPPONENTS_BY_SPORT = {
     "nba": NBA_TEAMS,
@@ -208,6 +212,10 @@ OPPONENTS_BY_SPORT = {
         "WPG",
         "WSH",
     ],
+    "tennis": ["", "DJOKOVIC", "ALCARAZ", "SINNER", "MEDVEDEV", "RUNE", "ZVEREV"],
+    "golf": ["", "SCHEFFLER", "MCILROY", "RAHM", "SCHAUFFELE", "THOMAS", "MORIKAWA"],
+    "cs2": ["", "NAVI", "FAZE", "G2", "VITALITY", "MOUZ", "SPIRIT"],
+    "cod": ["", "FAZE", "OPTIC", "ULTRA", "SURGE", "THIEVES", "SUBLINERS"],
 }
 
 

@@ -1,4 +1,4 @@
-rom fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from nba_api.stats.endpoints import leaguedashteamshotlocations, leaguedashteamstats, playergamelog

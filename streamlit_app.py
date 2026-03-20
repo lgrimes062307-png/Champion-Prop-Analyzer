@@ -61,7 +61,7 @@ DEFAULT_PRESETS = {
     },
 }
 
-SPORT_OPTIONS = ["nba", "mlb", "nfl", "soccer", "nhl", "tennis", "golf", "cs2", "cod"]
+SPORT_OPTIONS = ["nba", "ncaab", "mlb", "nfl", "soccer", "nhl", "tennis", "golf", "cs2", "cod"]
 NBA_TEAMS = [
     "",
     "ATL",
@@ -97,6 +97,7 @@ NBA_TEAMS = [
 ]
 PROP_OPTIONS_BY_SPORT = {
     "nba": ["points", "rebounds", "assists", "points+assists", "points+rebounds", "rebounds+assists", "pra"],
+    "ncaab": ["points", "rebounds", "assists", "points+assists", "points+rebounds", "rebounds+assists", "pra"],
     "mlb": ["hits", "runs", "rbis", "home_runs", "total_bases", "strikeouts"],
     "nfl": ["passing_yards", "rushing_yards", "receiving_yards", "receptions", "touchdowns"],
     "soccer": ["goals", "assists", "shots", "shots_on_target", "passes"],
@@ -108,6 +109,7 @@ PROP_OPTIONS_BY_SPORT = {
 }
 OPPONENTS_BY_SPORT = {
     "nba": NBA_TEAMS,
+    "ncaab": [""],
     "mlb": [
         "",
         "ARI",
@@ -331,6 +333,70 @@ def _render_bars(rows: List[Dict[str, Any]], label_key: str, value_key: str, col
         )
 
 
+def _color_for_percentile(pct: Optional[float]) -> str:
+    if pct is None:
+        return "#e0e0e0"
+    try:
+        value = max(0.0, min(100.0, float(pct)))
+    except Exception:
+        return "#e0e0e0"
+    # 0 = red, 100 = green
+    r = int(220 + (46 - 220) * (value / 100.0))
+    g = int(85 + (204 - 85) * (value / 100.0))
+    b = int(75 + (113 - 75) * (value / 100.0))
+    return f"rgb({r},{g},{b})"
+
+
+def _format_pct(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        val = float(value)
+    except Exception:
+        return "n/a"
+    if val <= 1.2:
+        val *= 100.0
+    return f"{val:.1f}%"
+
+
+def _render_defense_court(zones: List[Dict[str, Any]]) -> None:
+    if not zones:
+        st.write("No shot zone data.")
+        return
+    zone_map = {str(z.get("zone", "")): z for z in zones}
+    def zone_color(name: str) -> str:
+        return _color_for_percentile(zone_map.get(name, {}).get("percentile"))
+
+    def zone_pct(name: str) -> str:
+        return _format_pct(zone_map.get(name, {}).get("fg_pct"))
+
+    svg = f"""
+    <svg viewBox="0 0 600 420" width="100%" height="420" xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="0" width="600" height="420" fill="#fdf7f0" stroke="#c8a165" stroke-width="3"/>
+      <rect x="0" y="0" width="120" height="200" fill="{zone_color('Left Corner 3')}" opacity="0.85"/>
+      <rect x="480" y="0" width="120" height="200" fill="{zone_color('Right Corner 3')}" opacity="0.85"/>
+      <rect x="120" y="0" width="360" height="120" fill="{zone_color('Above the Break 3')}" opacity="0.85"/>
+      <rect x="120" y="120" width="360" height="120" fill="{zone_color('Mid-Range')}" opacity="0.85"/>
+      <rect x="200" y="220" width="200" height="150" fill="{zone_color('In The Paint (Non-RA)')}" opacity="0.9"/>
+      <rect x="240" y="290" width="120" height="80" fill="{zone_color('Restricted Area')}" opacity="0.95"/>
+      <rect x="0" y="0" width="600" height="420" fill="none" stroke="#c8a165" stroke-width="2"/>
+      <text x="60" y="30" text-anchor="middle" font-size="13" fill="#2d2d2d">L Corner 3</text>
+      <text x="60" y="48" text-anchor="middle" font-size="12" fill="#2d2d2d">{zone_pct('Left Corner 3')}</text>
+      <text x="540" y="30" text-anchor="middle" font-size="13" fill="#2d2d2d">R Corner 3</text>
+      <text x="540" y="48" text-anchor="middle" font-size="12" fill="#2d2d2d">{zone_pct('Right Corner 3')}</text>
+      <text x="300" y="30" text-anchor="middle" font-size="13" fill="#2d2d2d">Above Break 3</text>
+      <text x="300" y="48" text-anchor="middle" font-size="12" fill="#2d2d2d">{zone_pct('Above the Break 3')}</text>
+      <text x="300" y="145" text-anchor="middle" font-size="13" fill="#2d2d2d">Mid-Range</text>
+      <text x="300" y="163" text-anchor="middle" font-size="12" fill="#2d2d2d">{zone_pct('Mid-Range')}</text>
+      <text x="300" y="250" text-anchor="middle" font-size="13" fill="#2d2d2d">Paint</text>
+      <text x="300" y="268" text-anchor="middle" font-size="12" fill="#2d2d2d">{zone_pct('In The Paint (Non-RA)')}</text>
+      <text x="300" y="330" text-anchor="middle" font-size="13" fill="#2d2d2d">Restricted</text>
+      <text x="300" y="348" text-anchor="middle" font-size="12" fill="#2d2d2d">{zone_pct('Restricted Area')}</text>
+    </svg>
+    """
+    st.markdown(svg, unsafe_allow_html=True)
+
+
 def _backend_request(method: str, url: str, *, params=None, json_body=None) -> Tuple[Optional[Dict[str, Any]], str]:
     err = ""
     for attempt in range(BACKEND_RETRIES):
@@ -417,6 +483,34 @@ def _odds_edge_data(sport: str, market: str, bookmaker: str) -> Tuple[Optional[D
     return _backend_request("GET", f"{BACKEND_BASE_URL}/odds-edge", params=params)
 
 
+def _team_intel_data(
+    team: str,
+    season_type: str,
+    include_depth: bool,
+    include_injuries: bool,
+    include_defense: bool,
+    include_shot_zones: bool,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    params = {
+        "team": team,
+        "season_type": season_type,
+        "include_depth": include_depth,
+        "include_injuries": include_injuries,
+        "include_defense": include_defense,
+        "include_shot_zones": include_shot_zones,
+    }
+    return _backend_request("GET", f"{BACKEND_BASE_URL}/nba/team-intel", params=params)
+
+
+def _player_splits_data(player: str, without: str, season_type: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    params = {
+        "player": player,
+        "without": without,
+        "season_type": season_type,
+    }
+    return _backend_request("GET", f"{BACKEND_BASE_URL}/nba/player-splits", params=params)
+
+
 # ---------------- Sidebar ---------------- #
 
 if "custom_presets" not in st.session_state:
@@ -477,7 +571,9 @@ st.sidebar.caption(f"Mode: {'v2 POST' if BACKEND_USE_V2 else 'v1 GET'}")
 
 # ---------------- Tabs ---------------- #
 
-tab_analyze, tab_health, tab_perf, tab_picks, tab_odds = st.tabs(["Analyze", "Health", "Performance", "Picks", "Odds Edge"])
+tab_analyze, tab_research, tab_health, tab_perf, tab_picks, tab_odds = st.tabs(
+    ["Analyze", "Research", "Health", "Performance", "Picks", "Odds Edge"]
+)
 
 with tab_analyze:
     c1, c2 = st.columns([1, 1])
@@ -647,6 +743,124 @@ with tab_analyze:
             _render_table(history)
         else:
             st.write("No history yet.")
+
+with tab_research:
+    st.subheader("NBA Team Intel")
+    col_a, col_b, col_c = st.columns([1, 1, 1])
+    with col_a:
+        intel_team = st.selectbox("Team", NBA_TEAMS, index=0, key="intel_team")
+    with col_b:
+        intel_season_type = st.selectbox("Season Type", ["Regular Season", "Playoffs"], key="intel_season_type")
+    with col_c:
+        questionable_only = st.checkbox("Questionable only", value=False)
+
+    include_depth = st.checkbox("Depth chart", value=True)
+    include_injuries = st.checkbox("Injury report", value=True)
+    include_defense = st.checkbox("Defensive metrics", value=True)
+    include_shot_zones = st.checkbox("Shot zone defense (court)", value=True)
+
+    if st.button("Load Team Intel"):
+        if not intel_team:
+            st.warning("Select a team first.")
+        else:
+            payload, err = _team_intel_data(
+                intel_team,
+                intel_season_type,
+                include_depth,
+                include_injuries,
+                include_defense,
+                include_shot_zones,
+            )
+            if err:
+                st.error(err)
+            elif not payload:
+                st.warning("No team intel payload returned.")
+            else:
+                errors = payload.get("errors") or []
+                if errors:
+                    st.warning("Some sections failed:\n- " + "\n- ".join(errors[:6]))
+
+                if include_defense:
+                    defense = payload.get("defensive_metrics") or {}
+                    metrics = defense.get("metrics") or []
+                    team_name = defense.get("team_name") or intel_team
+                    st.markdown(f"**Defensive Metrics: {team_name}**")
+                    if metrics:
+                        _render_table(metrics)
+                    else:
+                        st.caption("No defensive metrics returned.")
+
+                if include_shot_zones:
+                    shot_profile = payload.get("shot_zones") or {}
+                    zones = shot_profile.get("zones") or []
+                    st.markdown("**Opponent Shot Map (FG% Allowed)**")
+                    if zones:
+                        _render_defense_court(zones)
+                        st.markdown("**Shot Zone Table**")
+                        _render_table(zones)
+                    else:
+                        st.caption("No shot zone data returned.")
+
+                if include_depth:
+                    st.markdown("**Depth Chart**")
+                    depth_rows = payload.get("depth_chart") or []
+                    if depth_rows:
+                        _render_table(depth_rows)
+                    else:
+                        st.caption("No depth chart data returned.")
+
+                if include_injuries:
+                    st.markdown("**Injury Report**")
+                    injuries = payload.get("injuries") or []
+                    if questionable_only:
+                        injuries = [row for row in injuries if "questionable" in str(row.get("status", "")).lower()]
+                    if injuries:
+                        _render_table(injuries)
+                    else:
+                        st.caption("No injury data returned.")
+
+    st.subheader("Player Splits Without Key Teammates")
+    split_col1, split_col2 = st.columns([1, 1])
+    with split_col1:
+        split_player = st.text_input("Player", "", key="split_player")
+    with split_col2:
+        split_without = st.text_input("Key players (comma-separated)", "", key="split_without")
+    split_season_type = st.selectbox("Season Type", ["Regular Season", "Playoffs"], key="split_season_type")
+
+    if st.button("Compute Splits"):
+        if not split_player.strip() or not split_without.strip():
+            st.warning("Enter a player and at least one key teammate.")
+        else:
+            payload, err = _player_splits_data(split_player.strip(), split_without.strip(), split_season_type)
+            if err:
+                st.error(err)
+            elif not payload:
+                st.warning("No player splits payload returned.")
+            else:
+                if payload.get("missing"):
+                    st.warning("Unknown players: " + ", ".join(payload["missing"]))
+                warnings = payload.get("warnings") or []
+                if warnings:
+                    st.warning("Notes:\n- " + "\n- ".join(warnings[:6]))
+
+                samples = payload.get("samples") or {}
+                if samples:
+                    st.markdown("**Samples**")
+                    _render_table([samples])
+
+                averages = payload.get("averages") or {}
+                rows = []
+                for key in ("overall", "without_any", "with_all"):
+                    avg = averages.get(key) or {}
+                    if avg:
+                        row = {"split": key}
+                        row.update(avg)
+                        rows.append(row)
+                st.markdown("**Averages**")
+                if rows:
+                    _render_table(rows)
+                else:
+                    st.caption("No averages returned.")
 
 with tab_health:
     st.subheader("Backend Health")

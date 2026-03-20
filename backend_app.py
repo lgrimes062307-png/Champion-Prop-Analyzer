@@ -1,7 +1,7 @@
-from fastapi import FastAPI, Query, Request, HTTPException
+rom fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from nba_api.stats.endpoints import leaguedashteamstats, playergamelog
+from nba_api.stats.endpoints import leaguedashteamshotlocations, leaguedashteamstats, playergamelog
 from nba_api.stats.static import players, teams
 from pydantic import BaseModel
 import datetime
@@ -13,7 +13,7 @@ import threading
 import sqlite3
 import requests
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 app = FastAPI()
 
@@ -50,10 +50,16 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 DB_PATH = os.getenv("DB_PATH", "app.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
 
-SUPPORTED_SPORTS = ("nba", "mlb", "nfl", "soccer", "nhl", "tennis", "golf", "cs2", "cod")
+SUPPORTED_SPORTS = ("nba", "ncaab", "mlb", "nfl", "soccer", "nhl", "tennis", "golf", "cs2", "cod")
 SPORT_ALIASES = {
     "nba": "nba",
     "basketball": "nba",
+    "ncaab": "ncaab",
+    "collegebasketball": "ncaab",
+    "college-basketball": "ncaab",
+    "college basketball": "ncaab",
+    "ncaa": "ncaab",
+    "cbb": "ncaab",
     "mlb": "mlb",
     "baseball": "mlb",
     "nfl": "nfl",
@@ -77,6 +83,22 @@ SPORT_ALIASES = {
 
 PROP_ALIASES_BY_SPORT = {
     "nba": {
+        "points": "points",
+        "pts": "points",
+        "rebounds": "rebounds",
+        "reb": "rebounds",
+        "assists": "assists",
+        "ast": "assists",
+        "points+rebounds": "pts+reb",
+        "points+assists": "pts+ast",
+        "rebounds+assists": "reb+ast",
+        "pts+reb": "pts+reb",
+        "pts+ast": "pts+ast",
+        "reb+ast": "reb+ast",
+        "pra": "pts+reb+ast",
+        "pts+reb+ast": "pts+reb+ast",
+    },
+    "ncaab": {
         "points": "points",
         "pts": "points",
         "rebounds": "rebounds",
@@ -194,6 +216,7 @@ NON_NBA_DVP_MAPS = {
         "COL": "Weak",
         "VGK": "Average",
     },
+    "ncaab": {},
     "tennis": {
         "DJOKOVIC": "Strong",
         "ALCARAZ": "Strong",
@@ -226,6 +249,7 @@ _rate_lock = threading.Lock()
 _rate_store: Dict[str, list] = {}
 _player_log_cache: Dict[tuple, dict] = {}
 _team_stats_cache: Dict[tuple, dict] = {}
+_team_shot_cache: Dict[tuple, dict] = {}
 _external_cache: Dict[tuple, dict] = {}
 EXTERNAL_TTL_SECONDS = int(os.getenv("EXTERNAL_TTL_SECONDS", "900"))
 EXTERNAL_HTTP_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_HTTP_TIMEOUT_SECONDS", "8"))
@@ -251,6 +275,7 @@ NFL_SEASON_YEAR = int(os.getenv("NFL_SEASON_YEAR", str(datetime.datetime.now().y
 SOCCER_SEASON_YEAR = int(os.getenv("SOCCER_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_LEAGUE = os.getenv("SOCCER_LEAGUE", "eng.1")
 SOCCER_TEAM = os.getenv("SOCCER_TEAM", "")
+NCAAB_SEASON_YEAR = int(os.getenv("NCAAB_SEASON_YEAR", "0"))
 TENNIS_SEASON_YEAR = int(os.getenv("TENNIS_SEASON_YEAR", str(datetime.datetime.now().year)))
 TENNIS_LEAGUE = os.getenv("TENNIS_LEAGUE", "atp")
 GOLF_SEASON_YEAR = int(os.getenv("GOLF_SEASON_YEAR", str(datetime.datetime.now().year)))
@@ -2003,6 +2028,7 @@ def get_injury_context(sport: str, player: str):
         return {"status": "unknown", "detail": "Player missing"}
     league_map = {
         "nba": ("basketball", "nba"),
+        "ncaab": ("basketball", "mens-college-basketball"),
         "nfl": ("football", "nfl"),
         "soccer": ("soccer", SOCCER_LEAGUE if "." in SOCCER_LEAGUE else "eng.1"),
         "nhl": ("hockey", "nhl"),
@@ -2051,6 +2077,8 @@ def _build_live_multi_sport_result(
     h2h_values: List[float] = []
     usage_values: List[float] = []
     dvp = "Average"
+    last_games_detail: List[dict] = []
+    h2h_games_detail: List[dict] = []
 
     if sport == "mlb":
         logs = _mlb_game_logs(player, season_year, season_type)
@@ -2077,6 +2105,38 @@ def _build_live_multi_sport_result(
         if athlete_id:
             payload = _espn_gamelog_payload("hockey", "nhl", athlete_id, season_year)
             prop_values, h2h_values = _collect_from_espn_payload(payload, _sport_metric_map("nhl").get(prop, []), opponent)
+    elif sport == "ncaab":
+        league_path = "mens-college-basketball"
+        athlete_id = _espn_find_player_id("basketball", league_path, player)
+        if athlete_id:
+            season_year_end = NCAAB_SEASON_YEAR if NCAAB_SEASON_YEAR > 0 else _season_label_to_end_year(season)
+            payload = _espn_gamelog_payload("basketball", league_path, athlete_id, season_year_end)
+            values, h2h_vals, usage_vals, game_details, h2h_game_details = _collect_nba_from_espn_payload(payload, prop, opponent)
+            prop_values, h2h_values, usage_values = values, h2h_vals, usage_vals
+            for row in game_details[:window_2]:
+                valf = float(row.get("prop_value", 0.0))
+                last_games_detail.append(
+                    {
+                        "date": row.get("date", ""),
+                        "opponent": row.get("opponent", ""),
+                        "prop_value": round(valf, 2),
+                        "line": float(line),
+                        "hit": _compare(valf, float(line), op),
+                        "minutes": row.get("minutes"),
+                    }
+                )
+            for row in h2h_game_details[:window_2]:
+                valf = float(row.get("prop_value", 0.0))
+                h2h_games_detail.append(
+                    {
+                        "date": row.get("date", ""),
+                        "opponent": row.get("opponent", ""),
+                        "prop_value": round(valf, 2),
+                        "line": float(line),
+                        "hit": _compare(valf, float(line), op),
+                        "minutes": row.get("minutes"),
+                    }
+                )
     elif sport == "tennis":
         league_path = TENNIS_LEAGUE or "atp"
         athlete_id = _espn_find_player_id("tennis", league_path, player)
@@ -2144,6 +2204,7 @@ def _build_live_multi_sport_result(
         "nfl": "Usage Projection",
         "soccer": "Minutes Projection",
         "nhl": "TOI Projection",
+        "ncaab": "Minutes Projection",
         "tennis": "Set Projection",
         "golf": "Round Projection",
         "cs2": "Map Projection",
@@ -2194,8 +2255,8 @@ def _build_live_multi_sport_result(
             "last_10_games": l10_n,
             "h2h_games": h2h_n,
         },
-        "last_games_detail": [],
-        "h2h_games_detail": [],
+        "last_games_detail": last_games_detail,
+        "h2h_games_detail": h2h_games_detail,
     }
 
 
@@ -2273,6 +2334,7 @@ def build_multi_sport_fallback(
         "nfl": "Usage Projection",
         "soccer": "Minutes Projection",
         "nhl": "TOI Projection",
+        "ncaab": "Minutes Projection",
         "tennis": "Set Projection",
         "golf": "Round Projection",
         "cs2": "Map Projection",
@@ -2355,35 +2417,41 @@ def dvp_label(def_rating: float, percent: float) -> str:
     return f"Poor (Def Rtg {def_rating:.1f})"
 
 
-def get_team_def_rating(season: str, season_type: str, opponent: str):
-    team_id = get_team_id(opponent)
-    if not team_id:
-        return "Unknown"
+def get_team_stats_df(season: str, season_type: str):
     cache_key = (season, season_type)
     now = time.time()
     cached = _team_stats_cache.get(cache_key)
     if cached and (now - cached["ts"] < TEAM_STATS_TTL_SECONDS):
-        stats = cached["df"]
-    else:
-        def fetch_stats():
-            try:
-                endpoint = leaguedashteamstats.LeagueDashTeamStats(
-                    season=season,
-                    season_type_all_star=season_type,
-                    timeout=NBA_HTTP_TIMEOUT_SECONDS,
-                    headers=NBA_HEADERS,
-                )
-            except TypeError:
-                endpoint = leaguedashteamstats.LeagueDashTeamStats(
-                    season=season,
-                    season_type_all_star=season_type,
-                )
-            return endpoint.get_data_frames()[0]
+        return cached["df"]
+
+    def fetch_stats():
         try:
-            stats = _nba_with_retries(fetch_stats)
-        except HTTPException:
-            return "Unknown"
-        _team_stats_cache[cache_key] = {"df": stats, "ts": now}
+            endpoint = leaguedashteamstats.LeagueDashTeamStats(
+                season=season,
+                season_type_all_star=season_type,
+                timeout=NBA_HTTP_TIMEOUT_SECONDS,
+                headers=NBA_HEADERS,
+            )
+        except TypeError:
+            endpoint = leaguedashteamstats.LeagueDashTeamStats(
+                season=season,
+                season_type_all_star=season_type,
+            )
+        return endpoint.get_data_frames()[0]
+
+    stats = _nba_with_retries(fetch_stats)
+    _team_stats_cache[cache_key] = {"df": stats, "ts": now}
+    return stats
+
+
+def get_team_def_rating(season: str, season_type: str, opponent: str):
+    team_id = get_team_id(opponent)
+    if not team_id:
+        return "Unknown"
+    try:
+        stats = get_team_stats_df(season, season_type)
+    except HTTPException:
+        return "Unknown"
     if "DEF_RATING" not in stats.columns:
         return "Unknown"
     stats = stats.sort_values("DEF_RATING").reset_index(drop=True)
@@ -2394,6 +2462,422 @@ def get_team_def_rating(season: str, season_type: str, opponent: str):
     percent = rank / len(stats)
     def_rating = float(stats.loc[idx[0], "DEF_RATING"])
     return dvp_label(def_rating, percent)
+
+
+def _espn_team_map():
+    cache_key = ("espn_team_map", "nba")
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached
+    url = "https://site.web.api.espn.com/apis/site/v2/sports/basketball/nba/teams"
+    payload = _fetch_json(url)
+    teams_list = []
+    if isinstance(payload, dict):
+        if isinstance(payload.get("sports"), list) and payload["sports"]:
+            leagues = payload["sports"][0].get("leagues", [])
+            if leagues and isinstance(leagues[0], dict):
+                teams_list = leagues[0].get("teams", []) or []
+        if not teams_list and isinstance(payload.get("teams"), list):
+            teams_list = payload.get("teams", []) or []
+    mapping = {}
+    for item in teams_list:
+        team = item.get("team") if isinstance(item, dict) else None
+        if team is None and isinstance(item, dict):
+            team = item
+        if not isinstance(team, dict):
+            continue
+        abbrev = team.get("abbreviation") or team.get("abbr") or team.get("shortName")
+        team_id = team.get("id")
+        if not abbrev or not team_id:
+            continue
+        display = team.get("displayName") or team.get("shortDisplayName") or team.get("name") or abbrev
+        mapping[str(abbrev).upper()] = {"id": str(team_id), "name": str(display)}
+    _set_cached_external(cache_key, mapping)
+    return mapping
+
+
+def _espn_team_id_for_abbrev(abbrev: str) -> Optional[str]:
+    if not abbrev:
+        return None
+    mapping = _espn_team_map()
+    entry = mapping.get(abbrev.strip().upper())
+    if not entry:
+        return None
+    return entry.get("id")
+
+
+def _parse_espn_depth_chart(payload: dict) -> List[dict]:
+    if not isinstance(payload, dict):
+        return []
+    positions = []
+    if isinstance(payload.get("positions"), list):
+        positions = payload.get("positions", [])
+    elif isinstance(payload.get("depthChart"), dict):
+        positions = payload["depthChart"].get("positions") or []
+    rows = []
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        pos_name = pos.get("position") or pos.get("name") or pos.get("displayName") or pos.get("abbreviation")
+        athletes = pos.get("athletes") or pos.get("athlete") or []
+        if not isinstance(athletes, list):
+            continue
+        for entry in athletes:
+            if not isinstance(entry, dict):
+                continue
+            athlete = entry.get("athlete") or entry.get("player") or {}
+            if not isinstance(athlete, dict):
+                athlete = {}
+            name = athlete.get("displayName") or athlete.get("fullName") or athlete.get("shortName") or athlete.get("name")
+            if not name:
+                continue
+            status = entry.get("injuryStatus") or entry.get("status") or athlete.get("injuryStatus")
+            if isinstance(status, dict):
+                status = status.get("type", {}).get("name") or status.get("name")
+            if isinstance(status, dict):
+                status = None
+            rank = entry.get("rank") or entry.get("depth") or entry.get("order") or entry.get("positionRank")
+            rows.append(
+                {
+                    "position": str(pos_name or ""),
+                    "slot": rank,
+                    "player": str(name),
+                    "status": str(status) if status else "",
+                }
+            )
+    return rows
+
+
+def _espn_team_depth_chart(team_id: str) -> List[dict]:
+    if not team_id:
+        return []
+    cache_key = ("espn_depth_chart", team_id)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or []
+    url = f"https://site.web.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/depthchart"
+    payload = _fetch_json(url)
+    rows = _parse_espn_depth_chart(payload or {})
+    _set_cached_external(cache_key, rows)
+    return rows
+
+
+def _parse_espn_injuries(payload: dict) -> List[dict]:
+    if not isinstance(payload, dict):
+        return []
+    injuries_list = payload.get("injuries")
+    if not isinstance(injuries_list, list):
+        team_obj = payload.get("team", {}) if isinstance(payload.get("team"), dict) else {}
+        injuries_list = team_obj.get("injuries")
+    if not isinstance(injuries_list, list):
+        return []
+    rows = []
+    for item in injuries_list:
+        if not isinstance(item, dict):
+            continue
+        athlete = item.get("athlete") or item.get("player") or {}
+        if not isinstance(athlete, dict):
+            athlete = {}
+        name = athlete.get("displayName") or athlete.get("fullName") or athlete.get("shortName") or athlete.get("name")
+        status = item.get("status") or item.get("injuryStatus") or item.get("type")
+        if isinstance(status, dict):
+            status = status.get("name") or status.get("type", {}).get("name")
+        if isinstance(status, dict):
+            status = None
+        detail = item.get("details") or item.get("description") or item.get("injury") or ""
+        if isinstance(detail, dict):
+            detail = detail.get("detail") or detail.get("description") or detail.get("type") or ""
+        date_val = item.get("date") or item.get("startDate") or item.get("updated")
+        rows.append(
+            {
+                "player": str(name or ""),
+                "status": str(status or ""),
+                "detail": str(detail or ""),
+                "date": str(date_val or ""),
+            }
+        )
+    return rows
+
+
+def _espn_team_injuries(team_id: str) -> List[dict]:
+    if not team_id:
+        return []
+    cache_key = ("espn_team_injuries", team_id)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or []
+    url = f"https://site.web.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/injuries"
+    payload = _fetch_json(url)
+    rows = _parse_espn_injuries(payload or {})
+    _set_cached_external(cache_key, rows)
+    return rows
+
+
+def _rank_metric(stats, team_id: int, column: str, ascending: bool) -> Tuple[Optional[int], Optional[float]]:
+    if column not in stats.columns:
+        return None, None
+    ordered = stats.sort_values(column, ascending=ascending).reset_index(drop=True)
+    idx = ordered.index[ordered["TEAM_ID"] == team_id]
+    if len(idx) == 0:
+        return None, None
+    rank = int(idx[0]) + 1
+    total = len(ordered)
+    if total <= 1:
+        pct = 100.0
+    else:
+        pct = round((1 - ((rank - 1) / (total - 1))) * 100.0, 2)
+    return rank, pct
+
+
+def get_team_defensive_metrics(season: str, season_type: str, team_abbrev: str) -> Dict[str, Any]:
+    team_id = get_team_id(team_abbrev)
+    if not team_id:
+        raise HTTPException(status_code=404, detail="Team not found")
+    stats = get_team_stats_df(season, season_type)
+    if stats is None or "TEAM_ID" not in stats.columns:
+        raise HTTPException(status_code=503, detail="Team stats unavailable")
+    row = stats.loc[stats["TEAM_ID"] == team_id]
+    if row.empty:
+        raise HTTPException(status_code=404, detail="Team not found in stats")
+    row = row.iloc[0]
+    metrics = []
+    candidates = [
+        ("DEF_RATING", "Def Rtg", True),
+        ("OPP_PTS", "Opp PTS", True),
+        ("OPP_FG_PCT", "Opp FG%", True),
+        ("OPP_FG2_PCT", "Opp 2P%", True),
+        ("OPP_FG3_PCT", "Opp 3P%", True),
+        ("OPP_EFG_PCT", "Opp eFG%", True),
+        ("OPP_FG3A", "Opp 3PA", True),
+        ("OPP_FGA", "Opp FGA", True),
+        ("OPP_FT_PCT", "Opp FT%", True),
+        ("OPP_FTA", "Opp FTA", True),
+        ("OPP_REB", "Opp REB", True),
+        ("OPP_OREB", "Opp OREB", True),
+        ("OPP_TOV", "Opp TOV", False),
+    ]
+    for column, label, ascending in candidates:
+        if column not in stats.columns:
+            continue
+        val = _numeric(row.get(column))
+        rank, pct = _rank_metric(stats, team_id, column, ascending)
+        metrics.append(
+            {
+                "metric": label,
+                "value": round(val, 4) if val is not None else None,
+                "rank": rank,
+                "percentile": pct,
+                "better": "lower" if ascending else "higher",
+            }
+        )
+    return {
+        "team_abbrev": team_abbrev.strip().upper(),
+        "team_name": str(row.get("TEAM_NAME", "")),
+        "season": season,
+        "season_type": season_type,
+        "metrics": metrics,
+    }
+
+
+def _rank_metric_by_index(stats, team_id: int, col_index: int, ascending: bool) -> Tuple[Optional[int], Optional[float]]:
+    if stats is None or col_index < 0 or col_index >= len(stats.columns):
+        return None, None
+    values = []
+    for _, row in stats.iterrows():
+        tid = row.get("TEAM_ID")
+        val = _numeric(row.iloc[col_index])
+        if tid is None or val is None:
+            continue
+        values.append((int(tid), float(val)))
+    if not values:
+        return None, None
+    values = sorted(values, key=lambda x: x[1], reverse=not ascending)
+    total = len(values)
+    rank = None
+    for idx, (tid, _) in enumerate(values):
+        if tid == int(team_id):
+            rank = idx + 1
+            break
+    if rank is None:
+        return None, None
+    if total <= 1:
+        pct = 100.0
+    else:
+        pct = round((1 - ((rank - 1) / (total - 1))) * 100.0, 2)
+    return rank, pct
+
+
+def get_team_shot_locations_df(season: str, season_type: str, measure_type: str):
+    cache_key = ("shot_locations", season, season_type, measure_type)
+    now = time.time()
+    cached = _team_shot_cache.get(cache_key)
+    if cached and (now - cached["ts"] < TEAM_STATS_TTL_SECONDS):
+        return cached["df"]
+
+    def fetch_stats():
+        try:
+            endpoint = leaguedashteamshotlocations.LeagueDashTeamShotLocations(
+                season=season,
+                season_type_all_star=season_type,
+                measure_type_simple=measure_type,
+                timeout=NBA_HTTP_TIMEOUT_SECONDS,
+                headers=NBA_HEADERS,
+            )
+        except TypeError:
+            endpoint = leaguedashteamshotlocations.LeagueDashTeamShotLocations(
+                season=season,
+                season_type_all_star=season_type,
+                measure_type_simple=measure_type,
+            )
+        return endpoint.get_data_frames()[0]
+
+    stats = _nba_with_retries(fetch_stats)
+    _team_shot_cache[cache_key] = {"df": stats, "ts": now}
+    return stats
+
+
+def get_team_defensive_shot_zones(season: str, season_type: str, team_abbrev: str) -> Dict[str, Any]:
+    team_id = get_team_id(team_abbrev)
+    if not team_id:
+        raise HTTPException(status_code=404, detail="Team not found")
+    stats = get_team_shot_locations_df(season, season_type, "Opponent")
+    if stats is None or "TEAM_ID" not in stats.columns:
+        raise HTTPException(status_code=503, detail="Shot location data unavailable")
+    row = stats.loc[stats["TEAM_ID"] == team_id]
+    if row.empty:
+        raise HTTPException(status_code=404, detail="Team not found in shot locations")
+    row = row.iloc[0]
+    values = list(row)
+    zone_names = [
+        "Restricted Area",
+        "In The Paint (Non-RA)",
+        "Mid-Range",
+        "Left Corner 3",
+        "Right Corner 3",
+        "Above the Break 3",
+        "Backcourt",
+    ]
+    base_idx = 2
+    zones = []
+    for i, zone in enumerate(zone_names):
+        idx = base_idx + (i * 3)
+        if idx + 2 >= len(values):
+            break
+        fgm = _numeric(values[idx])
+        fga = _numeric(values[idx + 1])
+        fg_pct = _numeric(values[idx + 2])
+        rank, pct = _rank_metric_by_index(stats, team_id, idx + 2, True)
+        zones.append(
+            {
+                "zone": zone,
+                "fgm": round(fgm, 2) if fgm is not None else None,
+                "fga": round(fga, 2) if fga is not None else None,
+                "fg_pct": round(fg_pct, 4) if fg_pct is not None else None,
+                "rank": rank,
+                "percentile": pct,
+            }
+        )
+    return {
+        "team_abbrev": team_abbrev.strip().upper(),
+        "team_name": str(row.get("TEAM_NAME", "")),
+        "season": season,
+        "season_type": season_type,
+        "zones": zones,
+    }
+
+
+def _avg_stats_from_df(df):
+    if df is None or df.empty:
+        return {"games": 0}
+    pts = [_numeric(v) for v in df.get("PTS", [])]
+    reb = [_numeric(v) for v in df.get("REB", [])]
+    ast = [_numeric(v) for v in df.get("AST", [])]
+    mins = [_numeric(v) for v in df.get("MIN", [])]
+    pts_vals = [v for v in pts if v is not None]
+    reb_vals = [v for v in reb if v is not None]
+    ast_vals = [v for v in ast if v is not None]
+    min_vals = [v for v in mins if v is not None]
+    pra_vals = []
+    for i in range(len(df)):
+        p = pts[i] if i < len(pts) else None
+        r = reb[i] if i < len(reb) else None
+        a = ast[i] if i < len(ast) else None
+        if p is None or r is None or a is None:
+            continue
+        pra_vals.append(p + r + a)
+    return {
+        "games": int(len(df)),
+        "avg_pts": round(sum(pts_vals) / len(pts_vals), 2) if pts_vals else None,
+        "avg_reb": round(sum(reb_vals) / len(reb_vals), 2) if reb_vals else None,
+        "avg_ast": round(sum(ast_vals) / len(ast_vals), 2) if ast_vals else None,
+        "avg_pra": round(sum(pra_vals) / len(pra_vals), 2) if pra_vals else None,
+        "avg_min": round(sum(min_vals) / len(min_vals), 2) if min_vals else None,
+    }
+
+
+def get_player_splits_without(player: str, without: List[str], season: str, season_type: str) -> Dict[str, Any]:
+    if not player or not without:
+        raise HTTPException(status_code=400, detail="Player and without list are required")
+    player_id = get_player_id(player)
+    if not player_id:
+        raise HTTPException(status_code=404, detail="Player not found")
+    without_ids = []
+    missing = []
+    for name in without:
+        pid = get_player_id(name)
+        if not pid:
+            missing.append(name)
+        else:
+            without_ids.append((name, pid))
+    if not without_ids:
+        raise HTTPException(status_code=404, detail="No valid key players found")
+    df_player = get_player_log(player_id, season, season_type)
+    if df_player is None or df_player.empty:
+        raise HTTPException(status_code=404, detail="No game logs found for player")
+
+    key_game_sets = {}
+    for name, pid in without_ids:
+        try:
+            df_key = get_player_log(pid, season, season_type)
+        except HTTPException:
+            df_key = None
+        if df_key is None or df_key.empty or "GAME_ID" not in df_key.columns:
+            key_game_sets[name] = set()
+        else:
+            key_game_sets[name] = set(df_key["GAME_ID"].astype(str).tolist())
+
+    if "GAME_ID" not in df_player.columns:
+        raise HTTPException(status_code=503, detail="Player logs missing GAME_ID")
+    df_player = df_player.copy()
+    df_player["GAME_ID"] = df_player["GAME_ID"].astype(str)
+    with_all = set.intersection(*[s for s in key_game_sets.values()]) if key_game_sets else set()
+    mask_with_all = df_player["GAME_ID"].isin(with_all) if with_all else [False] * len(df_player)
+    df_with_all = df_player[mask_with_all] if with_all else df_player.iloc[0:0]
+    df_without_any = df_player[~df_player["GAME_ID"].isin(with_all)] if key_game_sets else df_player
+    warnings = []
+    if any(len(s) == 0 for s in key_game_sets.values()):
+        warnings.append("Some key players had no logged games for the selected season.")
+    if df_with_all.empty:
+        warnings.append("No games found where all key players were active.")
+
+    return {
+        "player": player,
+        "season": season,
+        "season_type": season_type,
+        "without": [name for name, _ in without_ids],
+        "missing": missing,
+        "samples": {
+            "total_games": int(len(df_player)),
+            "without_any_games": int(len(df_without_any)),
+            "with_all_games": int(len(df_with_all)),
+        },
+        "averages": {
+            "overall": _avg_stats_from_df(df_player),
+            "without_any": _avg_stats_from_df(df_without_any),
+            "with_all": _avg_stats_from_df(df_with_all),
+        },
+        "warnings": warnings,
+    }
 
 
 def get_player_log(player_id: int, season: str, season_type: str):
@@ -2448,7 +2932,16 @@ def root():
         "ok": True,
         "service": "prop-analyzer-api",
         "model_version": MODEL_VERSION,
-        "endpoints": ["/health", "/analyze", "/evaluate", "/odds-edge", "/performance", "/picks"],
+        "endpoints": [
+            "/health",
+            "/analyze",
+            "/evaluate",
+            "/odds-edge",
+            "/performance",
+            "/picks",
+            "/nba/team-intel",
+            "/nba/player-splits",
+        ],
     }
 
 
@@ -3245,6 +3738,7 @@ def analyze_v2(request: Request, payload: AnalyzeRequestV2):
 def _odds_sport_key(sport: str):
     return {
         "nba": "basketball_nba",
+        "ncaab": "basketball_ncaab",
         "mlb": "baseball_mlb",
         "nfl": "americanfootball_nfl",
         "soccer": "soccer_epl",
@@ -3327,6 +3821,106 @@ def odds_edge(
     return {"count": len(rows), "rows": rows}
 
 
+@app.get("/nba/team-intel")
+def nba_team_intel(
+    team: str = Query(..., min_length=2),
+    season: str = Query(""),
+    season_type: str = "Regular Season",
+    include_depth: bool = Query(True),
+    include_injuries: bool = Query(True),
+    include_defense: bool = Query(True),
+    include_shot_zones: bool = Query(True),
+):
+    team_abbrev = team.strip().upper()
+    if not team_abbrev:
+        raise HTTPException(status_code=400, detail="Team is required")
+    season_label = season.strip() if season else current_season()
+    errors = []
+    team_name = ""
+    depth_chart = []
+    injuries = []
+    defense = None
+    shot_zones = None
+
+    espn_team_id = None
+    try:
+        espn_map = _espn_team_map()
+        entry = espn_map.get(team_abbrev, {})
+        espn_team_id = entry.get("id")
+        team_name = entry.get("name", "") if entry else ""
+    except HTTPException as exc:
+        errors.append(f"ESPN team lookup failed ({exc.status_code}): {exc.detail}")
+    except Exception as exc:
+        errors.append(f"ESPN team lookup failed: {type(exc).__name__}")
+
+    if include_depth:
+        if not espn_team_id:
+            errors.append("Depth chart unavailable: ESPN team id not found.")
+        else:
+            try:
+                depth_chart = _espn_team_depth_chart(espn_team_id)
+            except HTTPException as exc:
+                errors.append(f"Depth chart error ({exc.status_code}): {exc.detail}")
+            except Exception as exc:
+                errors.append(f"Depth chart error: {type(exc).__name__}")
+
+    if include_injuries:
+        if not espn_team_id:
+            errors.append("Injury report unavailable: ESPN team id not found.")
+        else:
+            try:
+                injuries = _espn_team_injuries(espn_team_id)
+            except HTTPException as exc:
+                errors.append(f"Injury report error ({exc.status_code}): {exc.detail}")
+            except Exception as exc:
+                errors.append(f"Injury report error: {type(exc).__name__}")
+
+    if include_defense:
+        try:
+            defense = get_team_defensive_metrics(season_label, season_type, team_abbrev)
+        except HTTPException as exc:
+            errors.append(f"Defensive metrics error ({exc.status_code}): {exc.detail}")
+        except Exception as exc:
+            errors.append(f"Defensive metrics error: {type(exc).__name__}")
+
+    if include_shot_zones:
+        try:
+            shot_zones = get_team_defensive_shot_zones(season_label, season_type, team_abbrev)
+        except HTTPException as exc:
+            errors.append(f"Shot zone metrics error ({exc.status_code}): {exc.detail}")
+        except Exception as exc:
+            errors.append(f"Shot zone metrics error: {type(exc).__name__}")
+
+    return {
+        "team": team_abbrev,
+        "team_name": team_name,
+        "season": season_label,
+        "season_type": season_type,
+        "depth_chart": depth_chart,
+        "injuries": injuries,
+        "defensive_metrics": defense,
+        "shot_zones": shot_zones,
+        "errors": errors,
+        "source_timestamp": _now_iso(),
+    }
+
+
+@app.get("/nba/player-splits")
+def nba_player_splits(
+    player: str = Query(..., min_length=1),
+    without: str = Query(..., min_length=1),
+    season: str = Query(""),
+    season_type: str = "Regular Season",
+):
+    names = [n.strip() for n in (without or "").split(",") if n.strip()]
+    if not names:
+        raise HTTPException(status_code=400, detail="Without list is required")
+    season_label = season.strip() if season else current_season()
+    result = get_player_splits_without(player, names, season_label, season_type)
+    result["source_timestamp"] = _now_iso()
+    return result
+
+
 @app.get("/health")
 def health():
     with _provider_lock:
@@ -3360,6 +3954,7 @@ def health():
         "cache": {
             "player_log_cache_size": len(_player_log_cache),
             "team_stats_cache_size": len(_team_stats_cache),
+            "team_shot_cache_size": len(_team_shot_cache),
             "external_cache_size": len(_external_cache),
         },
     }
@@ -3379,9 +3974,11 @@ def admin_reset_runtime(admin_secret: str = Query(..., min_length=1)):
     external_cache_size = len(_external_cache)
     player_cache_size = len(_player_log_cache)
     team_cache_size = len(_team_stats_cache)
+    team_shot_cache_size = len(_team_shot_cache)
     _external_cache.clear()
     _player_log_cache.clear()
     _team_stats_cache.clear()
+    _team_shot_cache.clear()
     _balldontlie_runtime_disabled_reason = ""
     _pandascore_runtime_disabled_reason = ""
     return {
@@ -3393,6 +3990,7 @@ def admin_reset_runtime(admin_secret: str = Query(..., min_length=1)):
             "external_cache": external_cache_size,
             "player_log_cache": player_cache_size,
             "team_stats_cache": team_cache_size,
+            "team_shot_cache": team_shot_cache_size,
         },
     }
 

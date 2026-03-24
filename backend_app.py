@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -255,9 +256,10 @@ EXTERNAL_TTL_SECONDS = int(os.getenv("EXTERNAL_TTL_SECONDS", "900"))
 EXTERNAL_HTTP_TIMEOUT_SECONDS = float(os.getenv("EXTERNAL_HTTP_TIMEOUT_SECONDS", "8"))
 EXTERNAL_HTTP_RETRIES = int(os.getenv("EXTERNAL_HTTP_RETRIES", "2"))
 EXTERNAL_RETRY_BACKOFF_SECONDS = float(os.getenv("EXTERNAL_RETRY_BACKOFF_SECONDS", "0.25"))
-NBA_HTTP_TIMEOUT_SECONDS = float(os.getenv("NBA_HTTP_TIMEOUT_SECONDS", "10"))
-NBA_HTTP_RETRIES = int(os.getenv("NBA_HTTP_RETRIES", "2"))
+NBA_HTTP_TIMEOUT_SECONDS = float(os.getenv("NBA_HTTP_TIMEOUT_SECONDS", "20"))
+NBA_HTTP_RETRIES = int(os.getenv("NBA_HTTP_RETRIES", "3"))
 NBA_RETRY_BACKOFF_SECONDS = float(os.getenv("NBA_RETRY_BACKOFF_SECONDS", "0.5"))
+NBA_CIRCUIT_BREAKER_ENABLED = os.getenv("NBA_CIRCUIT_BREAKER_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 BALDONTLIE_API_BASE_URL = os.getenv("BALDONTLIE_API_BASE_URL", "https://api.balldontlie.io/v1")
 BALDONTLIE_API_KEY = os.getenv("BALDONTLIE_API_KEY", "").strip()
 BALDONTLIE_ENABLED = os.getenv("BALDONTLIE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -272,6 +274,7 @@ PANDASCORE_HTTP_RETRIES = int(os.getenv("PANDASCORE_HTTP_RETRIES", "2"))
 PANDASCORE_RETRY_BACKOFF_SECONDS = float(os.getenv("PANDASCORE_RETRY_BACKOFF_SECONDS", "0.3"))
 PANDASCORE_COD_GAME = os.getenv("PANDASCORE_COD_GAME", "codmw").strip().lower()
 NFL_SEASON_YEAR = int(os.getenv("NFL_SEASON_YEAR", str(datetime.datetime.now().year)))
+MLB_SEASON_YEAR = int(os.getenv("MLB_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_SEASON_YEAR = int(os.getenv("SOCCER_SEASON_YEAR", str(datetime.datetime.now().year)))
 SOCCER_LEAGUE = os.getenv("SOCCER_LEAGUE", "eng.1")
 SOCCER_TEAM = os.getenv("SOCCER_TEAM", "")
@@ -428,6 +431,8 @@ def _pandascore_is_enabled() -> bool:
 
 
 def _provider_is_open(provider: str):
+    if provider == "nba_api" and not NBA_CIRCUIT_BREAKER_ENABLED:
+        return False
     if provider == "balldontlie" and not _balldontlie_is_enabled():
         return False
     if provider == "pandascore" and not _pandascore_is_enabled():
@@ -1209,7 +1214,7 @@ def _build_live_esports_result_from_pandascore(
             }
         )
 
-    return {
+    result = {
         "sport": sport,
         "player": player,
         "prop": prop,
@@ -1751,8 +1756,9 @@ def _mlb_find_player_id(player: str) -> Optional[int]:
     return player_id
 
 
-def _mlb_game_logs(player: str, season_year: int, season_type: str):
-    player_id = _mlb_find_player_id(player)
+def _mlb_game_logs(player: str, season_year: int, season_type: str, player_id: Optional[int] = None):
+    if player_id is None:
+        player_id = _mlb_find_player_id(player)
     if not player_id:
         return []
     game_type = "R" if season_type == "Regular Season" else "P"
@@ -1785,6 +1791,291 @@ def _mlb_game_logs(player: str, season_year: int, season_type: str):
             )
     _set_cached_external(cache_key, logs)
     return logs
+
+
+def _mlb_team_map():
+    cache_key = ("mlb_team_map",)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached
+    url = "https://statsapi.mlb.com/api/v1/teams"
+    data = _fetch_json(url, params={"sportId": 1})
+    mapping = {}
+    for team in data.get("teams", []) if isinstance(data, dict) else []:
+        abbrev = team.get("abbreviation") or team.get("fileCode") or team.get("teamCode")
+        if not abbrev:
+            continue
+        mapping[str(abbrev).upper()] = {
+            "id": int(team.get("id")),
+            "name": team.get("name") or team.get("teamName") or str(abbrev).upper(),
+        }
+    _set_cached_external(cache_key, mapping)
+    return mapping
+
+
+def _mlb_team_id(abbrev: str) -> Optional[int]:
+    if not abbrev:
+        return None
+    mapping = _mlb_team_map()
+    entry = mapping.get(abbrev.strip().upper())
+    if not entry:
+        return None
+    return entry.get("id")
+
+
+def _mlb_player_profile(player: str) -> Dict[str, Any]:
+    player_id = _mlb_find_player_id(player)
+    if not player_id:
+        return {}
+    cache_key = ("mlb_profile", player_id)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or {}
+    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}"
+    data = _fetch_json(url)
+    person = (data.get("people") or [{}])[0] if isinstance(data, dict) else {}
+    pos = person.get("primaryPosition") or {}
+    team = person.get("currentTeam") or {}
+    profile = {
+        "id": int(player_id),
+        "name": person.get("fullName") or person.get("name") or player,
+        "position_code": str(pos.get("code") or ""),
+        "position_abbrev": str(pos.get("abbreviation") or ""),
+        "position_name": str(pos.get("name") or ""),
+        "team_id": team.get("id"),
+        "team_name": team.get("name") or team.get("teamName") or "",
+        "bat_side": (person.get("batSide") or {}).get("code"),
+        "pitch_hand": (person.get("pitchHand") or {}).get("code"),
+    }
+    _set_cached_external(cache_key, profile)
+    return profile
+
+
+def _mlb_player_stats(player_id: int, group: str, season_year: int) -> Dict[str, Any]:
+    cache_key = ("mlb_player_stats", player_id, group, season_year)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or {}
+    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
+    data = _fetch_json(url, params={"stats": "season", "group": group, "season": season_year})
+    stat = {}
+    for block in data.get("stats", []) if isinstance(data, dict) else []:
+        splits = block.get("splits") or []
+        if not splits:
+            continue
+        stat = splits[0].get("stat") or {}
+        break
+    _set_cached_external(cache_key, stat)
+    return stat
+
+
+def _mlb_team_stats(team_id: int, group: str, season_year: int) -> Dict[str, Any]:
+    cache_key = ("mlb_team_stats", team_id, group, season_year)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or {}
+    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats"
+    data = _fetch_json(url, params={"stats": "season", "group": group, "season": season_year})
+    stat = {}
+    for block in data.get("stats", []) if isinstance(data, dict) else []:
+        splits = block.get("splits") or []
+        if not splits:
+            continue
+        stat = splits[0].get("stat") or {}
+        break
+    _set_cached_external(cache_key, stat)
+    return stat
+
+
+def _mlb_find_schedule_game(team_id: int, opponent_id: int, season_year: int) -> Optional[dict]:
+    if not team_id or not opponent_id:
+        return None
+    cache_key = ("mlb_schedule", team_id, opponent_id, season_year)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or None
+    today = datetime.date.today()
+    end_date = today + datetime.timedelta(days=7)
+    url = "https://statsapi.mlb.com/api/v1/schedule"
+    data = _fetch_json(
+        url,
+        params={
+            "sportId": 1,
+            "teamId": team_id,
+            "opponentId": opponent_id,
+            "season": season_year,
+            "gameTypes": "R,P",
+            "startDate": today.isoformat(),
+            "endDate": end_date.isoformat(),
+        },
+    )
+    games = []
+    for date_block in data.get("dates", []) if isinstance(data, dict) else []:
+        for game in date_block.get("games", []) or []:
+            game_date = game.get("gameDate") or ""
+            games.append((game_date, game))
+    if not games:
+        _set_cached_external(cache_key, None)
+        return None
+    games.sort(key=lambda x: x[0])
+    selected = games[0][1]
+    _set_cached_external(cache_key, selected)
+    return selected
+
+
+def _mlb_probable_pitcher(game: dict, opponent_id: int) -> Optional[dict]:
+    if not game or not opponent_id:
+        return None
+    teams = game.get("teams") or {}
+    for side in ("home", "away"):
+        team = (teams.get(side) or {}).get("team") or {}
+        if int(team.get("id", 0)) == int(opponent_id):
+            pitcher = (teams.get(side) or {}).get("probablePitcher") or {}
+            if pitcher:
+                return {"id": pitcher.get("id"), "name": pitcher.get("fullName") or pitcher.get("name")}
+    return None
+
+
+def _mlb_lineup_context(game_pk: int, team_id: int, player_id: int) -> Dict[str, Any]:
+    if not game_pk or not team_id or not player_id:
+        return {}
+    cache_key = ("mlb_lineup", game_pk, team_id, player_id)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or {}
+    url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+    payload = _fetch_json(url)
+    teams = payload.get("teams") if isinstance(payload, dict) else {}
+    target = None
+    for side in ("home", "away"):
+        block = teams.get(side) or {}
+        team = block.get("team") or {}
+        if int(team.get("id", 0)) == int(team_id):
+            target = block
+            break
+    if not target:
+        _set_cached_external(cache_key, None)
+        return {}
+    batting_order = target.get("battingOrder") or []
+    lineup_spot = None
+    ahead_ids = []
+    if isinstance(batting_order, list) and batting_order:
+        try:
+            idx = [int(pid) for pid in batting_order].index(int(player_id))
+            lineup_spot = idx + 1
+            ahead_ids = [int(pid) for pid in batting_order[:idx]]
+        except ValueError:
+            lineup_spot = None
+    if lineup_spot is None:
+        players = target.get("players") or {}
+        for key, pdata in players.items():
+            pid = pdata.get("person", {}).get("id")
+            if not pid or int(pid) != int(player_id):
+                continue
+            raw = pdata.get("battingOrder")
+            if raw is None:
+                continue
+            try:
+                spot = int(raw) // 100
+            except Exception:
+                continue
+            if spot:
+                lineup_spot = spot
+            break
+    result = {"lineup_spot": lineup_spot, "ahead_ids": ahead_ids}
+    _set_cached_external(cache_key, result)
+    return result
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _mlb_stat_float(stats: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[float]:
+    for key in keys:
+        if key in stats:
+            raw = stats.get(key)
+            if raw in (None, ""):
+                continue
+            val = _safe_float(raw, None)
+            if val is not None:
+                return val
+    return None
+
+
+def _mlb_lineup_factor(prop: str, spot: Optional[int]) -> float:
+    if not spot:
+        return 0.0
+    if prop == "rbis":
+        if spot in (3, 4, 5):
+            return 0.06
+        if spot == 2:
+            return 0.02
+        if spot in (6, 7):
+            return 0.01
+        if spot in (8, 9):
+            return -0.03
+        if spot == 1:
+            return -0.02
+        return 0.0
+    if prop == "runs":
+        if spot in (1, 2):
+            return 0.05
+        if spot in (3, 4, 5):
+            return 0.03
+        if spot in (8, 9):
+            return -0.04
+        if spot in (6, 7):
+            return -0.01
+        return 0.0
+    if spot in (1, 2, 3, 4, 5):
+        return 0.02
+    if spot in (8, 9):
+        return -0.02
+    return 0.0
+
+
+def _mlb_pitcher_factor(prop: str, stats: Dict[str, Any]) -> float:
+    if not stats:
+        return 0.0
+    era = _mlb_stat_float(stats, ("era",))
+    whip = _mlb_stat_float(stats, ("whip",))
+    k9 = _mlb_stat_float(stats, ("strikeoutsPer9Inn", "strikeOutsPer9Inn"))
+    hr9 = _mlb_stat_float(stats, ("homeRunsPer9", "homeRunsPer9Inn"))
+    if prop == "strikeouts":
+        if k9 is None:
+            return 0.0
+        return _clamp((k9 - 8.5) * 0.015, -0.06, 0.06)
+    factor = 0.0
+    if era is not None:
+        factor += _clamp((era - 4.1) * 0.02, -0.05, 0.05)
+    if whip is not None:
+        factor += _clamp((whip - 1.28) * 0.15, -0.05, 0.05)
+    if prop in ("home_runs", "total_bases") and hr9 is not None:
+        factor += _clamp((hr9 - 1.1) * 0.04, -0.04, 0.04)
+    return _clamp(factor, -0.08, 0.08)
+
+
+def _mlb_opponent_team_factor(prop: str, stats: Dict[str, Any]) -> float:
+    if not stats:
+        return 0.0
+    games = _mlb_stat_float(stats, ("gamesPlayed", "games", "g"))
+    strikeouts = _mlb_stat_float(stats, ("strikeOuts", "strikeouts"))
+    runs_per_game = _mlb_stat_float(stats, ("runsPerGame",))
+    ops = _mlb_stat_float(stats, ("ops", "onBasePlusSlugging"))
+    k_per_game = None
+    if games and strikeouts:
+        k_per_game = strikeouts / max(1.0, games)
+    if prop == "strikeouts":
+        if k_per_game is None:
+            return 0.0
+        return _clamp((k_per_game - 8.0) * 0.02, -0.06, 0.06)
+    factor = 0.0
+    if runs_per_game is not None:
+        factor += _clamp((runs_per_game - 4.4) * -0.015, -0.05, 0.05)
+    if ops is not None:
+        factor += _clamp((ops - 0.730) * -0.25, -0.05, 0.05)
+    return _clamp(factor, -0.08, 0.08)
 
 
 def _espn_find_player_id(sport_path: str, league_path: str, player: str) -> Optional[int]:
@@ -2079,10 +2370,96 @@ def _build_live_multi_sport_result(
     dvp = "Average"
     last_games_detail: List[dict] = []
     h2h_games_detail: List[dict] = []
+    mlb_context = None
+    mlb_context_delta = 0.0
 
     if sport == "mlb":
-        logs = _mlb_game_logs(player, season_year, season_type)
+        season_year = MLB_SEASON_YEAR
+        profile = _mlb_player_profile(player)
+        player_id = profile.get("id") if isinstance(profile, dict) else None
+        logs = _mlb_game_logs(player, season_year, season_type, player_id=player_id)
         prop_values, h2h_values, usage_values = _collect_from_mlb(logs, prop, opponent)
+        try:
+            mlb_context = {}
+            role = "pitcher" if str(profile.get("position_code")) == "1" or str(profile.get("position_abbrev")).upper() == "P" else "batter"
+            mlb_context["role"] = role
+            mlb_context["team_id"] = profile.get("team_id")
+            mlb_context["team_name"] = profile.get("team_name")
+            mlb_context["opponent"] = opponent.upper() if opponent else ""
+            opp_id = _mlb_team_id(opponent) if opponent else None
+            mlb_context["opponent_id"] = opp_id
+            game = _mlb_find_schedule_game(profile.get("team_id"), opp_id, season_year) if opp_id else None
+            if game:
+                mlb_context["game_pk"] = game.get("gamePk")
+                mlb_context["game_date"] = game.get("gameDate")
+            pitcher_info = None
+            lineup_spot = None
+            ahead_obp = None
+            team_obp = None
+            pitcher_stats = {}
+            opponent_team_stats = {}
+            if role == "batter" and opp_id and game:
+                pitcher_info = _mlb_probable_pitcher(game, opp_id)
+                if pitcher_info and pitcher_info.get("id"):
+                    pitcher_stats = _mlb_player_stats(int(pitcher_info["id"]), "pitching", season_year)
+                lineup_ctx = _mlb_lineup_context(game.get("gamePk"), profile.get("team_id"), player_id) if player_id else {}
+                lineup_spot = lineup_ctx.get("lineup_spot")
+                ahead_ids = lineup_ctx.get("ahead_ids") or []
+                if ahead_ids:
+                    obps = []
+                    for pid in ahead_ids[:3]:
+                        stats = _mlb_player_stats(int(pid), "hitting", season_year)
+                        obp = _mlb_stat_float(stats, ("obp", "onBasePercentage"))
+                        if obp is not None:
+                            obps.append(obp)
+                    if obps:
+                        ahead_obp = sum(obps) / len(obps)
+                team_stats = _mlb_team_stats(profile.get("team_id"), "hitting", season_year) if profile.get("team_id") else {}
+                team_obp = _mlb_stat_float(team_stats, ("obp", "onBasePercentage"))
+            if role == "pitcher" and opp_id:
+                opponent_team_stats = _mlb_team_stats(opp_id, "hitting", season_year)
+            pitcher_factor = _mlb_pitcher_factor(prop, pitcher_stats) if role == "batter" else 0.0
+            lineup_factor = _mlb_lineup_factor(prop, lineup_spot) if role == "batter" else 0.0
+            onbase_factor = 0.0
+            obp_ref = ahead_obp if ahead_obp is not None else team_obp
+            if role == "batter" and obp_ref is not None:
+                if prop == "rbis":
+                    onbase_factor = _clamp((obp_ref - 0.320) * 1.2, -0.05, 0.05)
+                elif prop == "runs":
+                    onbase_factor = _clamp((obp_ref - 0.320) * 0.8, -0.04, 0.04)
+            team_factor = _mlb_opponent_team_factor(prop, opponent_team_stats) if role == "pitcher" else 0.0
+            mlb_context_delta = _clamp(pitcher_factor + lineup_factor + onbase_factor + team_factor, -0.12, 0.12)
+            mlb_context.update(
+                {
+                    "role": role,
+                    "lineup_spot": lineup_spot,
+                    "ahead_obp": round(ahead_obp, 3) if ahead_obp is not None else None,
+                    "team_obp": round(team_obp, 3) if team_obp is not None else None,
+                    "pitcher": {
+                        "id": pitcher_info.get("id") if pitcher_info else None,
+                        "name": pitcher_info.get("name") if pitcher_info else None,
+                        "era": _mlb_stat_float(pitcher_stats, ("era",)),
+                        "whip": _mlb_stat_float(pitcher_stats, ("whip",)),
+                        "k_per_9": _mlb_stat_float(pitcher_stats, ("strikeoutsPer9Inn", "strikeOutsPer9Inn")),
+                        "hr_per_9": _mlb_stat_float(pitcher_stats, ("homeRunsPer9", "homeRunsPer9Inn")),
+                    },
+                    "opponent_team_stats": {
+                        "runs_per_game": _mlb_stat_float(opponent_team_stats, ("runsPerGame",)),
+                        "ops": _mlb_stat_float(opponent_team_stats, ("ops", "onBasePlusSlugging")),
+                        "strikeouts": _mlb_stat_float(opponent_team_stats, ("strikeOuts", "strikeouts")),
+                        "games_played": _mlb_stat_float(opponent_team_stats, ("gamesPlayed", "games", "g")),
+                    },
+                    "factors": {
+                        "pitcher_factor": round(pitcher_factor, 4),
+                        "lineup_factor": round(lineup_factor, 4),
+                        "onbase_factor": round(onbase_factor, 4),
+                        "team_factor": round(team_factor, 4),
+                        "context_delta": round(mlb_context_delta, 4),
+                    },
+                }
+            )
+        except Exception as exc:
+            mlb_context = {"error": f"MLB context unavailable: {type(exc).__name__}"}
     elif sport == "nfl":
         athlete_id = _espn_find_player_id("football", "nfl", player)
         if athlete_id:
@@ -2193,12 +2570,22 @@ def _build_live_multi_sport_result(
     avg_l5 = _mean(last_5_vals)
     avg_l10 = _mean(last_10_vals)
     avg_h2h = _mean(h2h_vals) if h2h_vals else 0.0
-    conf = confidence(l5_rate, l10_rate, h2h_rate, conf_l5_min, conf_l10_min, conf_h2h_good, conf_low_max)
+    conf_base = confidence(l5_rate, l10_rate, h2h_rate, conf_l5_min, conf_l10_min, conf_h2h_good, conf_low_max)
     expected_stat = weighted_expected_stat(avg_l5, avg_l10, avg_h2h, bool(h2h_vals))
+    if sport == "mlb" and mlb_context_delta:
+        expected_stat = round(expected_stat * (1 + mlb_context_delta), 2)
     rec = line_recommendation(expected_stat, line)
     proj_prob = projected_probability(l5_rate, l10_rate, h2h_rate, bool(h2h_vals))
-    conf = calibrate_confidence(conf, proj_prob)
+    if sport == "mlb" and mlb_context_delta:
+        proj_prob = round(_clamp(proj_prob + (mlb_context_delta * 20.0), 1.0, 99.0), 2)
+    conf = calibrate_confidence(conf_base, proj_prob)
     minutes_proj = round(_mean(usage_values) if usage_values else _mean(last_10_vals), 1)
+    if sport == "mlb" and mlb_context and isinstance(mlb_context, dict):
+        spot = mlb_context.get("lineup_spot")
+        if spot in (1, 2):
+            minutes_proj = round(minutes_proj + 0.4, 1)
+        elif spot in (8, 9):
+            minutes_proj = round(max(0.0, minutes_proj - 0.3), 1)
     projection_label = {
         "mlb": "Plate Appearances",
         "nfl": "Usage Projection",
@@ -2222,6 +2609,31 @@ def _build_live_multi_sport_result(
         f"Expected {prop}: {expected_stat:.2f} vs line {line}",
         f"Opponent context: {opponent.upper() if opponent else 'none'} ({dvp})",
     ]
+    if sport == "mlb" and isinstance(mlb_context, dict):
+        pitcher = mlb_context.get("pitcher") or {}
+        if mlb_context.get("role") == "batter" and pitcher.get("name"):
+            era = pitcher.get("era")
+            whip = pitcher.get("whip")
+            k9 = pitcher.get("k_per_9")
+            pitch_bits = []
+            if era is not None:
+                pitch_bits.append(f"ERA {era}")
+            if whip is not None:
+                pitch_bits.append(f"WHIP {whip}")
+            if k9 is not None:
+                pitch_bits.append(f"K/9 {k9}")
+            detail = " | ".join(pitch_bits) if pitch_bits else "stats unavailable"
+            reasons.append(f"Opposing pitcher: {pitcher.get('name')} ({detail}).")
+        if mlb_context.get("role") == "pitcher" and mlb_context.get("opponent"):
+            reasons.append(f"Opponent lineup: {mlb_context.get('opponent')}.")
+        if mlb_context.get("lineup_spot"):
+            reasons.append(f"Projected lineup spot: {mlb_context.get('lineup_spot')}.")
+        obp_note = mlb_context.get("ahead_obp") if mlb_context.get("ahead_obp") is not None else mlb_context.get("team_obp")
+        if obp_note is not None:
+            reasons.append(f"On-base context: {obp_note:.3f} OBP ahead.")
+        if mlb_context.get("factors", {}).get("context_delta"):
+            delta = float(mlb_context.get("factors", {}).get("context_delta") or 0)
+            reasons.append(f"Context adjustment: {delta:+.2%}.")
 
     return {
         "sport": sport,
@@ -2258,6 +2670,9 @@ def _build_live_multi_sport_result(
         "last_games_detail": last_games_detail,
         "h2h_games_detail": h2h_games_detail,
     }
+    if sport == "mlb":
+        result["mlb_context"] = mlb_context
+    return result
 
 
 def build_multi_sport_fallback(
@@ -2417,11 +2832,13 @@ def dvp_label(def_rating: float, percent: float) -> str:
     return f"Poor (Def Rtg {def_rating:.1f})"
 
 
-def get_team_stats_df(season: str, season_type: str):
+def get_team_stats_df(season: str, season_type: str, with_meta: bool = False):
     cache_key = (season, season_type)
     now = time.time()
     cached = _team_stats_cache.get(cache_key)
     if cached and (now - cached["ts"] < TEAM_STATS_TTL_SECONDS):
+        if with_meta:
+            return cached["df"], {"stale": False, "cached_at": cached["ts"]}
         return cached["df"]
 
     def fetch_stats():
@@ -2439,9 +2856,18 @@ def get_team_stats_df(season: str, season_type: str):
             )
         return endpoint.get_data_frames()[0]
 
-    stats = _nba_with_retries(fetch_stats)
-    _team_stats_cache[cache_key] = {"df": stats, "ts": now}
-    return stats
+    try:
+        stats = _nba_with_retries(fetch_stats)
+        _team_stats_cache[cache_key] = {"df": stats, "ts": now}
+        if with_meta:
+            return stats, {"stale": False, "cached_at": now}
+        return stats
+    except HTTPException:
+        if cached:
+            if with_meta:
+                return cached["df"], {"stale": True, "cached_at": cached["ts"]}
+            return cached["df"]
+        raise
 
 
 def get_team_def_rating(season: str, season_type: str, opponent: str):
@@ -2633,7 +3059,7 @@ def get_team_defensive_metrics(season: str, season_type: str, team_abbrev: str) 
     team_id = get_team_id(team_abbrev)
     if not team_id:
         raise HTTPException(status_code=404, detail="Team not found")
-    stats = get_team_stats_df(season, season_type)
+    stats, meta = get_team_stats_df(season, season_type, with_meta=True)
     if stats is None or "TEAM_ID" not in stats.columns:
         raise HTTPException(status_code=503, detail="Team stats unavailable")
     row = stats.loc[stats["TEAM_ID"] == team_id]
@@ -2676,6 +3102,8 @@ def get_team_defensive_metrics(season: str, season_type: str, team_abbrev: str) 
         "season": season,
         "season_type": season_type,
         "metrics": metrics,
+        "stale": bool(meta.get("stale")) if isinstance(meta, dict) else False,
+        "cached_at": meta.get("cached_at") if isinstance(meta, dict) else None,
     }
 
 
@@ -2707,11 +3135,13 @@ def _rank_metric_by_index(stats, team_id: int, col_index: int, ascending: bool) 
     return rank, pct
 
 
-def get_team_shot_locations_df(season: str, season_type: str, measure_type: str):
+def get_team_shot_locations_df(season: str, season_type: str, measure_type: str, with_meta: bool = False):
     cache_key = ("shot_locations", season, season_type, measure_type)
     now = time.time()
     cached = _team_shot_cache.get(cache_key)
     if cached and (now - cached["ts"] < TEAM_STATS_TTL_SECONDS):
+        if with_meta:
+            return cached["df"], {"stale": False, "cached_at": cached["ts"]}
         return cached["df"]
 
     def fetch_stats():
@@ -2731,16 +3161,25 @@ def get_team_shot_locations_df(season: str, season_type: str, measure_type: str)
             )
         return endpoint.get_data_frames()[0]
 
-    stats = _nba_with_retries(fetch_stats)
-    _team_shot_cache[cache_key] = {"df": stats, "ts": now}
-    return stats
+    try:
+        stats = _nba_with_retries(fetch_stats)
+        _team_shot_cache[cache_key] = {"df": stats, "ts": now}
+        if with_meta:
+            return stats, {"stale": False, "cached_at": now}
+        return stats
+    except HTTPException:
+        if cached:
+            if with_meta:
+                return cached["df"], {"stale": True, "cached_at": cached["ts"]}
+            return cached["df"]
+        raise
 
 
 def get_team_defensive_shot_zones(season: str, season_type: str, team_abbrev: str) -> Dict[str, Any]:
     team_id = get_team_id(team_abbrev)
     if not team_id:
         raise HTTPException(status_code=404, detail="Team not found")
-    stats = get_team_shot_locations_df(season, season_type, "Opponent")
+    stats, meta = get_team_shot_locations_df(season, season_type, "Opponent", with_meta=True)
     if stats is None or "TEAM_ID" not in stats.columns:
         raise HTTPException(status_code=503, detail="Shot location data unavailable")
     row = stats.loc[stats["TEAM_ID"] == team_id]
@@ -2783,6 +3222,8 @@ def get_team_defensive_shot_zones(season: str, season_type: str, team_abbrev: st
         "season": season,
         "season_type": season_type,
         "zones": zones,
+        "stale": bool(meta.get("stale")) if isinstance(meta, dict) else False,
+        "cached_at": meta.get("cached_at") if isinstance(meta, dict) else None,
     }
 
 

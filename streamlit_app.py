@@ -16,6 +16,92 @@ except Exception:  # pragma: no cover
 
 st.set_page_config(layout="wide", page_title="Multi-Sport Prop Analyzer")
 st.title("Multi-Sport Prop Analyzer")
+st.caption("Sharper reads. Clearer edges. Built for fast prop decisions.")
+
+st.markdown(
+    """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+html, body, [class*="stApp"] {
+  font-family: 'Space Grotesk', sans-serif;
+  background: linear-gradient(180deg, #f9f4ee 0%, #eef4f7 100%);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid #eadfce;
+  background: #ffffff;
+}
+.data-table thead tr {
+  background: linear-gradient(90deg, #efe4d6 0%, #f8efe3 100%);
+}
+.data-table th, .data-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #efe6d8;
+}
+.data-table tbody tr:hover {
+  background: #fff8ef;
+}
+
+.chart-card {
+  background: #ffffff;
+  border: 1px solid #eadfce;
+  border-radius: 16px;
+  padding: 12px 16px 10px 16px;
+  box-shadow: 0 10px 25px rgba(69, 47, 23, 0.06);
+}
+.chart-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 66px;
+  gap: 12px;
+  align-items: center;
+  margin: 10px 0;
+}
+.chart-label {
+  font-size: 13px;
+  color: #4b5563;
+  font-weight: 600;
+}
+.chart-value {
+  font-size: 12px;
+  color: #111827;
+  text-align: right;
+  background: #f3efe9;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-weight: 600;
+}
+.chart-bar {
+  position: relative;
+  height: 12px;
+  border-radius: 999px;
+  background: #f2ede6;
+  overflow: hidden;
+}
+.chart-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.35s ease;
+}
+.chart-dot {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 2px solid #ffffff;
+  box-shadow: 0 2px 8px rgba(17, 24, 39, 0.25);
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 
 # ---------------- Config ---------------- #
@@ -297,8 +383,8 @@ def _render_table(data: Any, *, max_rows: int = 300) -> None:
 
     table_html = (
         "<div style='overflow-x:auto;'>"
-        "<table style='width:100%; border-collapse:collapse; font-size:13px;'>"
-        "<thead><tr style='background:#f1f3f6;'>"
+        "<table class='data-table'>"
+        "<thead><tr>"
         f"{header_html}"
         "</tr></thead>"
         "<tbody>"
@@ -310,10 +396,32 @@ def _render_table(data: Any, *, max_rows: int = 300) -> None:
         st.caption(f"Showing {max_rows} of {len(rows)} rows.")
 
 
+def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    clean = (hex_color or "").lstrip("#")
+    if len(clean) != 6:
+        return (46, 134, 222)
+    try:
+        return tuple(int(clean[i:i+2], 16) for i in (0, 2, 4))
+    except Exception:
+        return (46, 134, 222)
+
+
+def _mix_with_white(rgb: Tuple[int, int, int], mix: float = 0.7) -> Tuple[int, int, int]:
+    mix = max(0.0, min(1.0, mix))
+    return tuple(int(c + (255 - c) * mix) for c in rgb)
+
+
+def _rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+    return "#%02x%02x%02x" % rgb
+
+
 def _render_bars(rows: List[Dict[str, Any]], label_key: str, value_key: str, color: str = "#2E86DE") -> None:
     if not rows:
         st.write("No chart data.")
         return
+    base_rgb = _hex_to_rgb(color)
+    soft_hex = _rgb_to_hex(_mix_with_white(base_rgb, 0.75))
+    rows_html = ""
     for row in rows:
         label = _cell_to_text(row.get(label_key, ""))
         try:
@@ -321,16 +429,18 @@ def _render_bars(rows: List[Dict[str, Any]], label_key: str, value_key: str, col
         except Exception:
             raw_val = 0.0
         val = max(0.0, min(100.0, raw_val))
-        st.markdown(
-            (
-                "<div style='margin:8px 0;'>"
-                f"<div style='font-size:13px; margin-bottom:3px;'>{html.escape(label)}: {val:.1f}</div>"
-                "<div style='background:#edf1f6; border-radius:7px; overflow:hidden; height:12px;'>"
-                f"<div style='width:{val}%; background:{color}; height:12px;'></div>"
-                "</div></div>"
-            ),
-            unsafe_allow_html=True,
+        dot_left = max(2.0, min(98.0, val))
+        rows_html += (
+            "<div class='chart-row'>"
+            f"<div class='chart-label'>{html.escape(label)}</div>"
+            "<div class='chart-bar'>"
+            f"<div class='chart-fill' style='width:{val}%; background:linear-gradient(90deg, {color} 0%, {soft_hex} 100%);'></div>"
+            f"<div class='chart-dot' style='left:{dot_left}%; background:{color};'></div>"
+            "</div>"
+            f"<div class='chart-value'>{val:.1f}</div>"
+            "</div>"
         )
+    st.markdown(f"<div class='chart-card'>{rows_html}</div>", unsafe_allow_html=True)
 
 
 def _color_for_percentile(pct: Optional[float]) -> str:
@@ -673,6 +783,27 @@ with tab_analyze:
             if injury_ctx.get("status") and injury_ctx.get("status") != "not_requested":
                 st.info(f"Injury: {injury_ctx.get('status')} | {injury_ctx.get('detail', '')}")
 
+            mlb_ctx = best.get("mlb_context") if isinstance(best, dict) else None
+            if mlb_ctx:
+                with st.expander("MLB Context"):
+                    summary = {
+                        "role": mlb_ctx.get("role"),
+                        "opponent": mlb_ctx.get("opponent"),
+                        "lineup_spot": mlb_ctx.get("lineup_spot"),
+                        "ahead_obp": mlb_ctx.get("ahead_obp"),
+                        "team_obp": mlb_ctx.get("team_obp"),
+                    }
+                    st.markdown("**Summary**")
+                    _render_table([summary])
+                    pitcher = mlb_ctx.get("pitcher") or {}
+                    if pitcher.get("name"):
+                        st.markdown("**Opposing Pitcher**")
+                        _render_table([pitcher])
+                    factors = mlb_ctx.get("factors") or {}
+                    if factors:
+                        st.markdown("**Context Factors**")
+                        _render_table([factors])
+
             reasons = best.get("reasons", []) or []
             if reasons:
                 with st.expander("Why this recommendation", expanded=True):
@@ -785,6 +916,8 @@ with tab_research:
                     metrics = defense.get("metrics") or []
                     team_name = defense.get("team_name") or intel_team
                     st.markdown(f"**Defensive Metrics: {team_name}**")
+                    if defense.get("stale"):
+                        st.warning("Defensive metrics are from cached data (live provider timed out).")
                     if metrics:
                         _render_table(metrics)
                     else:
@@ -794,6 +927,8 @@ with tab_research:
                     shot_profile = payload.get("shot_zones") or {}
                     zones = shot_profile.get("zones") or []
                     st.markdown("**Opponent Shot Map (FG% Allowed)**")
+                    if shot_profile.get("stale"):
+                        st.warning("Shot zone data is from cached results (live provider timed out).")
                     if zones:
                         _render_defense_court(zones)
                         st.markdown("**Shot Zone Table**")

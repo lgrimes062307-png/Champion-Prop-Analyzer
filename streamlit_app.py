@@ -792,6 +792,8 @@ with tab_analyze:
                         "lineup_spot": mlb_ctx.get("lineup_spot"),
                         "ahead_obp": mlb_ctx.get("ahead_obp"),
                         "team_obp": mlb_ctx.get("team_obp"),
+                        "log_season_year": mlb_ctx.get("log_season_year"),
+                        "log_fallback": mlb_ctx.get("log_fallback"),
                     }
                     st.markdown("**Summary**")
                     _render_table([summary])

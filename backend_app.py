@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -1869,6 +1868,17 @@ def _mlb_player_stats(player_id: int, group: str, season_year: int) -> Dict[str,
     return stat
 
 
+def _mlb_player_stats_with_fallback(player_id: int, group: str, season_year: int) -> Tuple[Dict[str, Any], int, bool]:
+    stats = _mlb_player_stats(player_id, group, season_year)
+    if stats:
+        return stats, season_year, False
+    if season_year > 0:
+        prev = _mlb_player_stats(player_id, group, season_year - 1)
+        if prev:
+            return prev, season_year - 1, True
+    return {}, season_year, False
+
+
 def _mlb_team_stats(team_id: int, group: str, season_year: int) -> Dict[str, Any]:
     cache_key = ("mlb_team_stats", team_id, group, season_year)
     cached = _cached_external(cache_key)
@@ -1885,6 +1895,17 @@ def _mlb_team_stats(team_id: int, group: str, season_year: int) -> Dict[str, Any
         break
     _set_cached_external(cache_key, stat)
     return stat
+
+
+def _mlb_team_stats_with_fallback(team_id: int, group: str, season_year: int) -> Tuple[Dict[str, Any], int, bool]:
+    stats = _mlb_team_stats(team_id, group, season_year)
+    if stats:
+        return stats, season_year, False
+    if season_year > 0:
+        prev = _mlb_team_stats(team_id, group, season_year - 1)
+        if prev:
+            return prev, season_year - 1, True
+    return {}, season_year, False
 
 
 def _mlb_find_schedule_game(team_id: int, opponent_id: int, season_year: int) -> Optional[dict]:
@@ -2379,6 +2400,15 @@ def _build_live_multi_sport_result(
         player_id = profile.get("id") if isinstance(profile, dict) else None
         logs = _mlb_game_logs(player, season_year, season_type, player_id=player_id)
         prop_values, h2h_values, usage_values = _collect_from_mlb(logs, prop, opponent)
+        log_season_year = season_year
+        log_fallback = False
+        if not prop_values and season_year > 0:
+            prev_year = season_year - 1
+            logs = _mlb_game_logs(player, prev_year, season_type, player_id=player_id)
+            prop_values, h2h_values, usage_values = _collect_from_mlb(logs, prop, opponent)
+            if prop_values:
+                log_season_year = prev_year
+                log_fallback = True
         try:
             mlb_context = {}
             role = "pitcher" if str(profile.get("position_code")) == "1" or str(profile.get("position_abbrev")).upper() == "P" else "batter"
@@ -2386,6 +2416,8 @@ def _build_live_multi_sport_result(
             mlb_context["team_id"] = profile.get("team_id")
             mlb_context["team_name"] = profile.get("team_name")
             mlb_context["opponent"] = opponent.upper() if opponent else ""
+            mlb_context["log_season_year"] = log_season_year
+            mlb_context["log_fallback"] = log_fallback
             opp_id = _mlb_team_id(opponent) if opponent else None
             mlb_context["opponent_id"] = opp_id
             game = _mlb_find_schedule_game(profile.get("team_id"), opp_id, season_year) if opp_id else None
@@ -2398,26 +2430,29 @@ def _build_live_multi_sport_result(
             team_obp = None
             pitcher_stats = {}
             opponent_team_stats = {}
+            pitcher_stats_year = None
+            opponent_stats_year = None
+            team_stats_year = None
             if role == "batter" and opp_id and game:
                 pitcher_info = _mlb_probable_pitcher(game, opp_id)
                 if pitcher_info and pitcher_info.get("id"):
-                    pitcher_stats = _mlb_player_stats(int(pitcher_info["id"]), "pitching", season_year)
+                    pitcher_stats, pitcher_stats_year, _ = _mlb_player_stats_with_fallback(int(pitcher_info["id"]), "pitching", season_year)
                 lineup_ctx = _mlb_lineup_context(game.get("gamePk"), profile.get("team_id"), player_id) if player_id else {}
                 lineup_spot = lineup_ctx.get("lineup_spot")
                 ahead_ids = lineup_ctx.get("ahead_ids") or []
                 if ahead_ids:
                     obps = []
                     for pid in ahead_ids[:3]:
-                        stats = _mlb_player_stats(int(pid), "hitting", season_year)
+                        stats, _, _ = _mlb_player_stats_with_fallback(int(pid), "hitting", season_year)
                         obp = _mlb_stat_float(stats, ("obp", "onBasePercentage"))
                         if obp is not None:
                             obps.append(obp)
                     if obps:
                         ahead_obp = sum(obps) / len(obps)
-                team_stats = _mlb_team_stats(profile.get("team_id"), "hitting", season_year) if profile.get("team_id") else {}
+                team_stats, team_stats_year, _ = _mlb_team_stats_with_fallback(profile.get("team_id"), "hitting", season_year) if profile.get("team_id") else ({}, None, False)
                 team_obp = _mlb_stat_float(team_stats, ("obp", "onBasePercentage"))
             if role == "pitcher" and opp_id:
-                opponent_team_stats = _mlb_team_stats(opp_id, "hitting", season_year)
+                opponent_team_stats, opponent_stats_year, _ = _mlb_team_stats_with_fallback(opp_id, "hitting", season_year)
             pitcher_factor = _mlb_pitcher_factor(prop, pitcher_stats) if role == "batter" else 0.0
             lineup_factor = _mlb_lineup_factor(prop, lineup_spot) if role == "batter" else 0.0
             onbase_factor = 0.0
@@ -2442,13 +2477,16 @@ def _build_live_multi_sport_result(
                         "whip": _mlb_stat_float(pitcher_stats, ("whip",)),
                         "k_per_9": _mlb_stat_float(pitcher_stats, ("strikeoutsPer9Inn", "strikeOutsPer9Inn")),
                         "hr_per_9": _mlb_stat_float(pitcher_stats, ("homeRunsPer9", "homeRunsPer9Inn")),
+                        "season_year": pitcher_stats_year,
                     },
                     "opponent_team_stats": {
                         "runs_per_game": _mlb_stat_float(opponent_team_stats, ("runsPerGame",)),
                         "ops": _mlb_stat_float(opponent_team_stats, ("ops", "onBasePlusSlugging")),
                         "strikeouts": _mlb_stat_float(opponent_team_stats, ("strikeOuts", "strikeouts")),
                         "games_played": _mlb_stat_float(opponent_team_stats, ("gamesPlayed", "games", "g")),
+                        "season_year": opponent_stats_year,
                     },
+                    "team_stats_year": team_stats_year,
                     "factors": {
                         "pitcher_factor": round(pitcher_factor, 4),
                         "lineup_factor": round(lineup_factor, 4),
@@ -2610,6 +2648,8 @@ def _build_live_multi_sport_result(
         f"Opponent context: {opponent.upper() if opponent else 'none'} ({dvp})",
     ]
     if sport == "mlb" and isinstance(mlb_context, dict):
+        if mlb_context.get("log_fallback") and mlb_context.get("log_season_year"):
+            reasons.append(f"No current-season logs yet; using {mlb_context.get('log_season_year')} season logs.")
         pitcher = mlb_context.get("pitcher") or {}
         if mlb_context.get("role") == "batter" and pitcher.get("name"):
             era = pitcher.get("era")

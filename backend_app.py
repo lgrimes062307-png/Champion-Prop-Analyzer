@@ -3753,7 +3753,7 @@ def build_mlb_pitcher_market_edges(
 def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, min_score: float = 55.0, limit: int = 10) -> Dict[str, Any]:
     rotowire_index = _rotowire_lineup_index(game_date)
     games = _mlb_schedule_games_for_date(game_date)
-    recommendations: List[Dict[str, Any]] = []
+    all_recommendations: List[Dict[str, Any]] = []
     analyzed_pitchers = 0
 
     for game in games:
@@ -3766,8 +3766,6 @@ def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, mi
             if not prop_candidates:
                 continue
             best = prop_candidates[0]
-            if float(best.get("score") or 0.0) < float(min_score):
-                continue
             pitcher_metrics = snapshot.get("pitcher") or {}
             lineup_summary = snapshot.get("lineup") or {}
             projections = _project_pitcher_market_means(snapshot, prop_candidates=prop_candidates)
@@ -3780,7 +3778,7 @@ def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, mi
                 "",
             )
             model_projection = projections.get(model_market_key, {}) if model_market_key else {}
-            recommendations.append(
+            all_recommendations.append(
                 {
                     "pitcher": pitcher_metrics.get("name"),
                     "pitcher_id": snapshot.get("pitcher_id"),
@@ -3824,7 +3822,9 @@ def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, mi
                 }
             )
 
-    recommendations.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    all_recommendations.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    qualified_recommendations = [row for row in all_recommendations if float(row.get("score") or 0.0) >= float(min_score)]
+    returned_recommendations = qualified_recommendations or all_recommendations
     return {
         "sport": "mlb",
         "date": game_date.isoformat(),
@@ -3832,7 +3832,11 @@ def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, mi
         "model_version": MODEL_VERSION,
         "weights": MLB_PITCH_PROP_WEIGHTS,
         "analyzed_pitchers": analyzed_pitchers,
-        "recommendations": recommendations[: max(1, int(limit))],
+        "min_score": min_score,
+        "qualified_count": len(qualified_recommendations),
+        "fallback_used": not bool(qualified_recommendations) and bool(all_recommendations),
+        "message": "No pitchers cleared the minimum score; showing the best available model-ranked pitchers." if not qualified_recommendations and all_recommendations else "",
+        "recommendations": returned_recommendations[: max(1, int(limit))],
         "data_sources": {
             "fangraphs": "legacy leaderboards types 1, 5, and 24",
             "baseballsavant": "statcast_search grouped pitch traits by primary pitch",

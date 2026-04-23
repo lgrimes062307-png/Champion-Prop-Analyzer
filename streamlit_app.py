@@ -1596,10 +1596,15 @@ with tab_pitch:
 
     if model_error:
         st.warning(f"Pitch Lab unavailable: {model_error}")
-    elif model_payload.get("fallback_used"):
-        st.info(model_payload.get("message") or "Showing the best available pitcher rankings because nobody cleared the current score threshold.")
+    elif model_rows:
+        qualified_count = int(model_payload.get("qualified_count", len(model_rows)) or 0)
+        analyzed_pitchers = int(model_payload.get("analyzed_pitchers", len(model_rows)) or 0)
+        if qualified_count > 0:
+            st.caption(f"Showing {len(model_rows)} ranked pitchers from {analyzed_pitchers} analyzed probable starters.")
+        else:
+            st.caption(f"Showing {len(model_rows)} top-ranked pitchers from {analyzed_pitchers} analyzed probable starters.")
     if not model_rows and not model_error:
-        st.info("Load a slate to see ranked pitcher props, matchup visuals, and source checks.")
+        st.info("No probable starters were returned for this slate yet. Try another date or check again closer to first pitch.")
 
     if model_rows:
         best_model = model_rows[0]

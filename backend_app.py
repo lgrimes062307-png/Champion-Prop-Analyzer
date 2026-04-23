@@ -327,6 +327,12 @@ class AnalyzeRequestV2(BaseModel):
     conf_low_max: Optional[float] = None
     offered_odds: Optional[int] = None
     include_injury: bool = False
+    pitcher_name: str = ""
+    venue: str = ""
+    wind_mph: Optional[float] = None
+    wind_direction: str = ""
+    temperature_f: Optional[float] = None
+    altitude_ft: Optional[float] = None
 
 
 def init_db():
@@ -2008,6 +2014,274 @@ def _mlb_lineup_context(game_pk: int, team_id: int, player_id: int) -> Dict[str,
     return result
 
 
+MLB_PARK_ALTITUDE_FT = {
+    "Coors Field": 5183,
+    "Chase Field": 1090,
+    "Kauffman Stadium": 900,
+    "Truist Park": 1026,
+    "Great American Ball Park": 490,
+    "Globe Life Field": 551,
+    "Wrigley Field": 594,
+    "Fenway Park": 20,
+    "Yankee Stadium": 55,
+    "Citi Field": 25,
+    "Citizens Bank Park": 39,
+    "Oriole Park at Camden Yards": 33,
+    "Nationals Park": 25,
+    "loanDepot park": 8,
+    "Tropicana Field": 11,
+    "Minute Maid Park": 43,
+    "T-Mobile Park": 52,
+    "Oracle Park": 13,
+    "Petco Park": 62,
+    "Dodger Stadium": 340,
+    "Angel Stadium": 160,
+    "Oakland Coliseum": 14,
+    "Sutter Health Park": 35,
+    "American Family Field": 635,
+    "Target Field": 840,
+    "Guaranteed Rate Field": 595,
+    "Comerica Park": 585,
+    "Progressive Field": 653,
+    "PNC Park": 725,
+    "Busch Stadium": 466,
+    "Rogers Centre": 249,
+}
+
+
+def _mlb_parse_wind_text(text: str) -> Tuple[Optional[float], str]:
+    if not text:
+        return None, ""
+    lowered = str(text).strip().lower()
+    mph = _extract_first_number(lowered)
+    direction = ""
+    if "out to" in lowered:
+        direction = "out"
+    elif "in from" in lowered:
+        direction = "in"
+    elif "left to right" in lowered:
+        direction = "left_to_right"
+    elif "right to left" in lowered:
+        direction = "right_to_left"
+    elif "calm" in lowered or "none" in lowered:
+        direction = "calm"
+    return mph, direction
+
+
+def _mlb_game_environment(game_pk: Optional[int]) -> Dict[str, Any]:
+    if not game_pk:
+        return {}
+    cache_key = ("mlb_game_env", int(game_pk))
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or {}
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{int(game_pk)}/feed/live"
+    payload = _fetch_json(url)
+    game_data = payload.get("gameData", {}) if isinstance(payload, dict) else {}
+    venue = (game_data.get("venue") or {}).get("name") or ""
+    weather = game_data.get("weather") or {}
+    temp_raw = weather.get("temp")
+    temp_f = _extract_first_number(str(temp_raw)) if temp_raw is not None else None
+    wind_text = str(weather.get("wind") or "")
+    wind_mph, wind_direction = _mlb_parse_wind_text(wind_text)
+    altitude_ft = MLB_PARK_ALTITUDE_FT.get(str(venue))
+    out = {
+        "venue": str(venue or ""),
+        "temperature_f": temp_f,
+        "wind_mph": wind_mph,
+        "wind_direction": wind_direction,
+        "altitude_ft": altitude_ft,
+        "raw_weather": weather,
+    }
+    _set_cached_external(cache_key, out)
+    return out
+
+
+def _mlb_player_pitch_arsenal(player_id: int, group: str, season_year: int) -> List[dict]:
+    cache_key = ("mlb_pitch_arsenal", player_id, group, season_year)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or []
+    url = f"https://statsapi.mlb.com/api/v1/people/{player_id}"
+    hydrate = f"stats(group=[{group}],type=[pitchArsenal],season={season_year})"
+    payload = _fetch_json(url, params={"hydrate": hydrate})
+    people = payload.get("people", []) if isinstance(payload, dict) else []
+    if not people:
+        _set_cached_external(cache_key, [])
+        return []
+    stats_blocks = people[0].get("stats") or []
+    if not stats_blocks:
+        _set_cached_external(cache_key, [])
+        return []
+    splits = stats_blocks[0].get("splits") or []
+    rows = []
+    for split in splits:
+        stat = split.get("stat") or {}
+        ptype = stat.get("type") or {}
+        rows.append(
+            {
+                "code": str(ptype.get("code") or ""),
+                "description": str(ptype.get("description") or ""),
+                "percentage": _safe_float(stat.get("percentage")),
+                "count": int(_safe_float(stat.get("count"))) if stat.get("count") is not None else None,
+                "total_pitches": int(_safe_float(stat.get("totalPitches"))) if stat.get("totalPitches") is not None else None,
+                "avg_speed": _safe_float(stat.get("averageSpeed"), None),
+            }
+        )
+    _set_cached_external(cache_key, rows)
+    return rows
+
+
+def _mlb_player_pitch_arsenal_with_fallback(player_id: int, group: str, season_year: int) -> Tuple[List[dict], int, bool]:
+    rows = _mlb_player_pitch_arsenal(player_id, group, season_year)
+    if rows:
+        return rows, season_year, False
+    if season_year > 0:
+        prev = _mlb_player_pitch_arsenal(player_id, group, season_year - 1)
+        if prev:
+            return prev, season_year - 1, True
+    return [], season_year, False
+
+
+def _mlb_primary_pitch(player_id: int, season_year: int) -> Dict[str, Any]:
+    rows, used_year, fallback = _mlb_player_pitch_arsenal_with_fallback(player_id, "pitching", season_year)
+    if not rows:
+        return {}
+    rows_sorted = sorted(rows, key=lambda x: float(x.get("percentage") or 0.0), reverse=True)
+    top = rows_sorted[0]
+    return {
+        "code": top.get("code"),
+        "description": top.get("description"),
+        "usage_pct": round(float(top.get("percentage") or 0.0) * 100.0, 2),
+        "avg_speed": round(float(top.get("avg_speed")), 2) if top.get("avg_speed") is not None else None,
+        "season_year": used_year,
+        "fallback": fallback,
+    }
+
+
+def _mlb_hitter_pitch_profile(player_id: int, season_year: int) -> Tuple[Dict[str, dict], int, bool]:
+    cache_key = ("mlb_hitter_pitch_profile", player_id, season_year)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached.get("profile", {}), int(cached.get("season_year", season_year)), bool(cached.get("fallback", False))
+
+    def _build(year: int) -> Dict[str, dict]:
+        url = f"https://statsapi.mlb.com/api/v1/people/{player_id}"
+        hydrate = f"stats(group=[hitting],type=[pitchLog],season={year})"
+        payload = _fetch_json(url, params={"hydrate": hydrate})
+        people = payload.get("people", []) if isinstance(payload, dict) else []
+        if not people:
+            return {}
+        stats_blocks = people[0].get("stats") or []
+        if not stats_blocks:
+            return {}
+        splits = stats_blocks[0].get("splits") or []
+        profile: Dict[str, dict] = {}
+        for split in splits:
+            stat = split.get("stat", {}) or {}
+            play = stat.get("play", {}) or {}
+            details = play.get("details", {}) or {}
+            pitch_type = details.get("type", {}) or {}
+            code = str(pitch_type.get("code") or "").upper()
+            if not code:
+                continue
+            is_at_bat = bool(details.get("isAtBat"))
+            if not is_at_bat:
+                continue
+            event_type = str(details.get("eventType") or "").lower()
+            base_hit = bool(details.get("isBaseHit"))
+            rec = profile.setdefault(code, {"pitch_code": code, "at_bats": 0, "hits": 0, "home_runs": 0, "total_bases": 0, "strikeouts": 0})
+            rec["at_bats"] += 1
+            if base_hit:
+                rec["hits"] += 1
+            if event_type == "home_run":
+                rec["home_runs"] += 1
+            if event_type in ("strikeout", "strikeout_double_play"):
+                rec["strikeouts"] += 1
+            if event_type == "single":
+                rec["total_bases"] += 1
+            elif event_type == "double":
+                rec["total_bases"] += 2
+            elif event_type == "triple":
+                rec["total_bases"] += 3
+            elif event_type == "home_run":
+                rec["total_bases"] += 4
+        for code, rec in profile.items():
+            ab = max(1, int(rec["at_bats"]))
+            rec["avg"] = round(rec["hits"] / ab, 3)
+            rec["slg"] = round(rec["total_bases"] / ab, 3)
+            rec["hr_rate"] = round(rec["home_runs"] / ab, 3)
+            rec["k_rate"] = round(rec["strikeouts"] / ab, 3)
+        return profile
+
+    profile = _build(season_year)
+    used_year = season_year
+    fallback = False
+    if not profile and season_year > 0:
+        used_year = season_year - 1
+        profile = _build(used_year)
+        fallback = bool(profile)
+    _set_cached_external(cache_key, {"profile": profile, "season_year": used_year, "fallback": fallback})
+    return profile, used_year, fallback
+
+
+def _mlb_pitch_match_factor(prop: str, pitch_stats: Dict[str, Any]) -> float:
+    if not pitch_stats:
+        return 0.0
+    avg = _safe_float(pitch_stats.get("avg"), None)
+    slg = _safe_float(pitch_stats.get("slg"), None)
+    hr_rate = _safe_float(pitch_stats.get("hr_rate"), None)
+    k_rate = _safe_float(pitch_stats.get("k_rate"), None)
+    if prop == "home_runs":
+        if hr_rate is None:
+            return 0.0
+        return _clamp((hr_rate - 0.035) * 1.8, -0.06, 0.06)
+    if prop == "total_bases":
+        if slg is None:
+            return 0.0
+        return _clamp((slg - 0.390) * 0.35, -0.06, 0.06)
+    if prop == "strikeouts":
+        if k_rate is None:
+            return 0.0
+        return _clamp((k_rate - 0.225) * 0.6, -0.06, 0.06)
+    if avg is None:
+        return 0.0
+    return _clamp((avg - 0.245) * 0.8, -0.06, 0.06)
+
+
+def _mlb_environment_factor(
+    prop: str,
+    role: str,
+    altitude_ft: Optional[float],
+    wind_mph: Optional[float],
+    wind_direction: str,
+    temperature_f: Optional[float],
+) -> float:
+    factor = 0.0
+    offense_boost = 0.0
+    if altitude_ft is not None:
+        offense_boost += _clamp((float(altitude_ft) - 500.0) / 7000.0, -0.04, 0.08)
+    if temperature_f is not None:
+        offense_boost += _clamp((float(temperature_f) - 70.0) / 200.0, -0.04, 0.04)
+    if wind_mph is not None and wind_direction:
+        mph = max(0.0, float(wind_mph))
+        if wind_direction in ("out", "out_to_center", "out_to_left", "out_to_right"):
+            offense_boost += _clamp(mph / 180.0, 0.0, 0.08)
+        elif wind_direction in ("in", "in_from_center", "in_from_left", "in_from_right"):
+            offense_boost -= _clamp(mph / 180.0, 0.0, 0.08)
+    if role == "pitcher":
+        offense_boost *= -1.0
+    if prop == "home_runs":
+        factor = offense_boost * 1.5
+    elif prop == "total_bases":
+        factor = offense_boost * 1.2
+    elif prop in ("hits", "runs", "rbis"):
+        factor = offense_boost
+    elif prop == "strikeouts":
+        factor = offense_boost * -0.8
+    return _clamp(factor, -0.10, 0.10)
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -2382,6 +2656,12 @@ def _build_live_multi_sport_result(
     conf_h2h_good: float,
     conf_low_max: float,
     season_type: str,
+    pitcher_name: str = "",
+    venue: str = "",
+    wind_mph: Optional[float] = None,
+    wind_direction: str = "",
+    temperature_f: Optional[float] = None,
+    altitude_ft: Optional[float] = None,
 ):
     season = current_season()
     season_year = _season_label_to_year(season)
@@ -2433,8 +2713,21 @@ def _build_live_multi_sport_result(
             pitcher_stats_year = None
             opponent_stats_year = None
             team_stats_year = None
+            game_env = _mlb_game_environment(game.get("gamePk")) if game else {}
+            selected_venue = str(venue or game_env.get("venue") or "")
+            selected_temp = temperature_f if temperature_f is not None else game_env.get("temperature_f")
+            selected_wind_mph = wind_mph if wind_mph is not None else game_env.get("wind_mph")
+            selected_wind_direction = (wind_direction or game_env.get("wind_direction") or "").strip().lower()
+            selected_altitude = altitude_ft if altitude_ft is not None else game_env.get("altitude_ft")
+            if selected_altitude is None and selected_venue:
+                selected_altitude = MLB_PARK_ALTITUDE_FT.get(selected_venue)
+            selected_pitcher_name = pitcher_name.strip()
             if role == "batter" and opp_id and game:
-                pitcher_info = _mlb_probable_pitcher(game, opp_id)
+                if selected_pitcher_name:
+                    override_pid = _mlb_find_player_id(selected_pitcher_name)
+                    pitcher_info = {"id": override_pid, "name": selected_pitcher_name}
+                else:
+                    pitcher_info = _mlb_probable_pitcher(game, opp_id)
                 if pitcher_info and pitcher_info.get("id"):
                     pitcher_stats, pitcher_stats_year, _ = _mlb_player_stats_with_fallback(int(pitcher_info["id"]), "pitching", season_year)
                 lineup_ctx = _mlb_lineup_context(game.get("gamePk"), profile.get("team_id"), player_id) if player_id else {}
@@ -2451,6 +2744,11 @@ def _build_live_multi_sport_result(
                         ahead_obp = sum(obps) / len(obps)
                 team_stats, team_stats_year, _ = _mlb_team_stats_with_fallback(profile.get("team_id"), "hitting", season_year) if profile.get("team_id") else ({}, None, False)
                 team_obp = _mlb_stat_float(team_stats, ("obp", "onBasePercentage"))
+            elif role == "batter" and selected_pitcher_name:
+                override_pid = _mlb_find_player_id(selected_pitcher_name)
+                if override_pid:
+                    pitcher_info = {"id": override_pid, "name": selected_pitcher_name}
+                    pitcher_stats, pitcher_stats_year, _ = _mlb_player_stats_with_fallback(int(override_pid), "pitching", season_year)
             if role == "pitcher" and opp_id:
                 opponent_team_stats, opponent_stats_year, _ = _mlb_team_stats_with_fallback(opp_id, "hitting", season_year)
             pitcher_factor = _mlb_pitcher_factor(prop, pitcher_stats) if role == "batter" else 0.0
@@ -2463,7 +2761,26 @@ def _build_live_multi_sport_result(
                 elif prop == "runs":
                     onbase_factor = _clamp((obp_ref - 0.320) * 0.8, -0.04, 0.04)
             team_factor = _mlb_opponent_team_factor(prop, opponent_team_stats) if role == "pitcher" else 0.0
-            mlb_context_delta = _clamp(pitcher_factor + lineup_factor + onbase_factor + team_factor, -0.12, 0.12)
+            primary_pitch = {}
+            hitter_pitch_stats = {}
+            hitter_pitch_year = None
+            hitter_pitch_fallback = False
+            pitch_match_factor = 0.0
+            if role == "batter" and pitcher_info and pitcher_info.get("id") and player_id:
+                primary_pitch = _mlb_primary_pitch(int(pitcher_info["id"]), season_year)
+                hitter_pitch_profile, hitter_pitch_year, hitter_pitch_fallback = _mlb_hitter_pitch_profile(int(player_id), season_year)
+                if primary_pitch.get("code"):
+                    hitter_pitch_stats = hitter_pitch_profile.get(str(primary_pitch.get("code")).upper(), {})
+                    pitch_match_factor = _mlb_pitch_match_factor(prop, hitter_pitch_stats)
+            env_factor = _mlb_environment_factor(
+                prop=prop,
+                role=role,
+                altitude_ft=_safe_float(selected_altitude, None),
+                wind_mph=_safe_float(selected_wind_mph, None),
+                wind_direction=selected_wind_direction,
+                temperature_f=_safe_float(selected_temp, None),
+            )
+            mlb_context_delta = _clamp(pitcher_factor + lineup_factor + onbase_factor + team_factor + pitch_match_factor + env_factor, -0.16, 0.16)
             mlb_context.update(
                 {
                     "role": role,
@@ -2487,11 +2804,27 @@ def _build_live_multi_sport_result(
                         "season_year": opponent_stats_year,
                     },
                     "team_stats_year": team_stats_year,
+                    "environment": {
+                        "venue": selected_venue,
+                        "temperature_f": _safe_float(selected_temp, None),
+                        "wind_mph": _safe_float(selected_wind_mph, None),
+                        "wind_direction": selected_wind_direction,
+                        "altitude_ft": _safe_float(selected_altitude, None),
+                    },
+                    "pitch_matchup": {
+                        "primary_pitch": primary_pitch,
+                        "hitter_pitch_stats": hitter_pitch_stats,
+                        "hitter_pitch_year": hitter_pitch_year,
+                        "hitter_pitch_fallback": hitter_pitch_fallback,
+                        "pitch_match_factor": round(pitch_match_factor, 4),
+                    },
                     "factors": {
                         "pitcher_factor": round(pitcher_factor, 4),
                         "lineup_factor": round(lineup_factor, 4),
                         "onbase_factor": round(onbase_factor, 4),
                         "team_factor": round(team_factor, 4),
+                        "environment_factor": round(env_factor, 4),
+                        "pitch_match_factor": round(pitch_match_factor, 4),
                         "context_delta": round(mlb_context_delta, 4),
                     },
                 }
@@ -2664,6 +2997,21 @@ def _build_live_multi_sport_result(
                 pitch_bits.append(f"K/9 {k9}")
             detail = " | ".join(pitch_bits) if pitch_bits else "stats unavailable"
             reasons.append(f"Opposing pitcher: {pitcher.get('name')} ({detail}).")
+        pitch_match = mlb_context.get("pitch_matchup") or {}
+        primary_pitch = pitch_match.get("primary_pitch") or {}
+        hitter_pitch_stats = pitch_match.get("hitter_pitch_stats") or {}
+        if primary_pitch.get("code"):
+            pitch_desc = primary_pitch.get("description") or primary_pitch.get("code")
+            usage = primary_pitch.get("usage_pct")
+            if usage is not None:
+                reasons.append(f"Pitch profile: {pitch_desc} is primary at {usage:.1f}% usage.")
+            else:
+                reasons.append(f"Pitch profile: {pitch_desc} is primary.")
+            if hitter_pitch_stats.get("avg") is not None:
+                reasons.append(
+                    f"Hitter vs {primary_pitch.get('code')}: AVG {float(hitter_pitch_stats.get('avg')):.3f}"
+                    f" | SLG {float(hitter_pitch_stats.get('slg', 0.0)):.3f}."
+                )
         if mlb_context.get("role") == "pitcher" and mlb_context.get("opponent"):
             reasons.append(f"Opponent lineup: {mlb_context.get('opponent')}.")
         if mlb_context.get("lineup_spot"):
@@ -2671,11 +3019,17 @@ def _build_live_multi_sport_result(
         obp_note = mlb_context.get("ahead_obp") if mlb_context.get("ahead_obp") is not None else mlb_context.get("team_obp")
         if obp_note is not None:
             reasons.append(f"On-base context: {obp_note:.3f} OBP ahead.")
+        env = mlb_context.get("environment") or {}
+        if env.get("venue"):
+            reasons.append(
+                f"Park/weather: {env.get('venue')} | wind {env.get('wind_mph')} mph {env.get('wind_direction') or 'n/a'}"
+                f" | temp {env.get('temperature_f')}F | altitude {env.get('altitude_ft')} ft."
+            )
         if mlb_context.get("factors", {}).get("context_delta"):
             delta = float(mlb_context.get("factors", {}).get("context_delta") or 0)
             reasons.append(f"Context adjustment: {delta:+.2%}.")
 
-    return {
+    result = {
         "sport": sport,
         "player": player,
         "prop": prop,
@@ -2872,8 +3226,14 @@ def dvp_label(def_rating: float, percent: float) -> str:
     return f"Poor (Def Rtg {def_rating:.1f})"
 
 
-def get_team_stats_df(season: str, season_type: str, with_meta: bool = False):
-    cache_key = (season, season_type)
+def get_team_stats_df(
+    season: str,
+    season_type: str,
+    team_id: Optional[int] = None,
+    per_mode: str = "Totals",
+    with_meta: bool = False,
+):
+    cache_key = ("team_stats", season, season_type, team_id or "all", per_mode)
     now = time.time()
     cached = _team_stats_cache.get(cache_key)
     if cached and (now - cached["ts"] < TEAM_STATS_TTL_SECONDS):
@@ -2886,6 +3246,8 @@ def get_team_stats_df(season: str, season_type: str, with_meta: bool = False):
             endpoint = leaguedashteamstats.LeagueDashTeamStats(
                 season=season,
                 season_type_all_star=season_type,
+                team_id_nullable=str(team_id or ""),
+                per_mode_detailed=per_mode,
                 timeout=NBA_HTTP_TIMEOUT_SECONDS,
                 headers=NBA_HEADERS,
             )
@@ -2893,6 +3255,8 @@ def get_team_stats_df(season: str, season_type: str, with_meta: bool = False):
             endpoint = leaguedashteamstats.LeagueDashTeamStats(
                 season=season,
                 season_type_all_star=season_type,
+                team_id_nullable=str(team_id or ""),
+                per_mode_detailed=per_mode,
             )
         return endpoint.get_data_frames()[0]
 
@@ -3099,7 +3463,11 @@ def get_team_defensive_metrics(season: str, season_type: str, team_abbrev: str) 
     team_id = get_team_id(team_abbrev)
     if not team_id:
         raise HTTPException(status_code=404, detail="Team not found")
-    stats, meta = get_team_stats_df(season, season_type, with_meta=True)
+    stats, meta = get_team_stats_df(season, season_type, per_mode="PerGame", with_meta=True)
+    rank_available = True
+    if stats is None or "TEAM_ID" not in stats.columns:
+        stats, meta = get_team_stats_df(season, season_type, team_id=team_id, per_mode="PerGame", with_meta=True)
+        rank_available = False
     if stats is None or "TEAM_ID" not in stats.columns:
         raise HTTPException(status_code=503, detail="Team stats unavailable")
     row = stats.loc[stats["TEAM_ID"] == team_id]
@@ -3126,7 +3494,10 @@ def get_team_defensive_metrics(season: str, season_type: str, team_abbrev: str) 
         if column not in stats.columns:
             continue
         val = _numeric(row.get(column))
-        rank, pct = _rank_metric(stats, team_id, column, ascending)
+        if rank_available:
+            rank, pct = _rank_metric(stats, team_id, column, ascending)
+        else:
+            rank, pct = None, None
         metrics.append(
             {
                 "metric": label,
@@ -3144,6 +3515,7 @@ def get_team_defensive_metrics(season: str, season_type: str, team_abbrev: str) 
         "metrics": metrics,
         "stale": bool(meta.get("stale")) if isinstance(meta, dict) else False,
         "cached_at": meta.get("cached_at") if isinstance(meta, dict) else None,
+        "ranked": rank_available,
     }
 
 
@@ -3175,8 +3547,15 @@ def _rank_metric_by_index(stats, team_id: int, col_index: int, ascending: bool) 
     return rank, pct
 
 
-def get_team_shot_locations_df(season: str, season_type: str, measure_type: str, with_meta: bool = False):
-    cache_key = ("shot_locations", season, season_type, measure_type)
+def get_team_shot_locations_df(
+    season: str,
+    season_type: str,
+    measure_type: str,
+    team_id: Optional[int] = None,
+    per_mode: str = "PerGame",
+    with_meta: bool = False,
+):
+    cache_key = ("shot_locations", season, season_type, measure_type, team_id or "all", per_mode)
     now = time.time()
     cached = _team_shot_cache.get(cache_key)
     if cached and (now - cached["ts"] < TEAM_STATS_TTL_SECONDS):
@@ -3190,6 +3569,8 @@ def get_team_shot_locations_df(season: str, season_type: str, measure_type: str,
                 season=season,
                 season_type_all_star=season_type,
                 measure_type_simple=measure_type,
+                team_id_nullable=str(team_id or ""),
+                per_mode_detailed=per_mode,
                 timeout=NBA_HTTP_TIMEOUT_SECONDS,
                 headers=NBA_HEADERS,
             )
@@ -3198,6 +3579,8 @@ def get_team_shot_locations_df(season: str, season_type: str, measure_type: str,
                 season=season,
                 season_type_all_star=season_type,
                 measure_type_simple=measure_type,
+                team_id_nullable=str(team_id or ""),
+                per_mode_detailed=per_mode,
             )
         return endpoint.get_data_frames()[0]
 
@@ -3220,6 +3603,10 @@ def get_team_defensive_shot_zones(season: str, season_type: str, team_abbrev: st
     if not team_id:
         raise HTTPException(status_code=404, detail="Team not found")
     stats, meta = get_team_shot_locations_df(season, season_type, "Opponent", with_meta=True)
+    rank_available = True
+    if stats is None or "TEAM_ID" not in stats.columns:
+        stats, meta = get_team_shot_locations_df(season, season_type, "Opponent", team_id=team_id, with_meta=True)
+        rank_available = False
     if stats is None or "TEAM_ID" not in stats.columns:
         raise HTTPException(status_code=503, detail="Shot location data unavailable")
     row = stats.loc[stats["TEAM_ID"] == team_id]
@@ -3245,7 +3632,10 @@ def get_team_defensive_shot_zones(season: str, season_type: str, team_abbrev: st
         fgm = _numeric(values[idx])
         fga = _numeric(values[idx + 1])
         fg_pct = _numeric(values[idx + 2])
-        rank, pct = _rank_metric_by_index(stats, team_id, idx + 2, True)
+        if rank_available:
+            rank, pct = _rank_metric_by_index(stats, team_id, idx + 2, True)
+        else:
+            rank, pct = None, None
         zones.append(
             {
                 "zone": zone,
@@ -3264,6 +3654,7 @@ def get_team_defensive_shot_zones(season: str, season_type: str, team_abbrev: st
         "zones": zones,
         "stale": bool(meta.get("stale")) if isinstance(meta, dict) else False,
         "cached_at": meta.get("cached_at") if isinstance(meta, dict) else None,
+        "ranked": rank_available,
     }
 
 
@@ -3444,6 +3835,12 @@ def evaluate(
     conf_low_max: float = Query(None, ge=0, le=100),
     offered_odds: Optional[int] = Query(None),
     include_injury: bool = Query(False),
+    pitcher_name: str = "",
+    venue: str = "",
+    wind_mph: Optional[float] = Query(None),
+    wind_direction: str = "",
+    temperature_f: Optional[float] = Query(None),
+    altitude_ft: Optional[float] = Query(None),
 ):
     normalized_sport = normalize_sport(sport)
     if not normalized_sport:
@@ -3486,6 +3883,12 @@ def evaluate(
                 conf_h2h_good=h2h_good,
                 conf_low_max=low_max,
                 season_type=season_type,
+                pitcher_name=pitcher_name,
+                venue=venue,
+                wind_mph=wind_mph,
+                wind_direction=wind_direction,
+                temperature_f=temperature_f,
+                altitude_ft=altitude_ft,
             )
         except HTTPException as exc:
             live_error = f"Live provider error ({exc.status_code}): {exc.detail}"
@@ -4055,6 +4458,12 @@ def _analyze_safe(
     conf_low_max: Optional[float],
     offered_odds: Optional[int],
     include_injury: bool,
+    pitcher_name: str = "",
+    venue: str = "",
+    wind_mph: Optional[float] = None,
+    wind_direction: str = "",
+    temperature_f: Optional[float] = None,
+    altitude_ft: Optional[float] = None,
 ):
     try:
         return evaluate(
@@ -4074,6 +4483,12 @@ def _analyze_safe(
             conf_low_max=conf_low_max,
             offered_odds=offered_odds,
             include_injury=include_injury,
+            pitcher_name=pitcher_name,
+            venue=venue,
+            wind_mph=wind_mph,
+            wind_direction=wind_direction,
+            temperature_f=temperature_f,
+            altitude_ft=altitude_ft,
         )
     except HTTPException:
         raise
@@ -4146,6 +4561,12 @@ def analyze(
     conf_low_max: float = Query(None, ge=0, le=100),
     offered_odds: Optional[int] = Query(None),
     include_injury: bool = Query(False),
+    pitcher_name: str = "",
+    venue: str = "",
+    wind_mph: Optional[float] = Query(None),
+    wind_direction: str = "",
+    temperature_f: Optional[float] = Query(None),
+    altitude_ft: Optional[float] = Query(None),
 ):
     return _analyze_safe(
         request=request,
@@ -4164,6 +4585,12 @@ def analyze(
         conf_low_max=conf_low_max,
         offered_odds=offered_odds,
         include_injury=include_injury,
+        pitcher_name=pitcher_name,
+        venue=venue,
+        wind_mph=wind_mph,
+        wind_direction=wind_direction,
+        temperature_f=temperature_f,
+        altitude_ft=altitude_ft,
     )
 
 
@@ -4188,6 +4615,12 @@ def analyze_v2(request: Request, payload: AnalyzeRequestV2):
             conf_low_max=payload.conf_low_max,
             offered_odds=payload.offered_odds,
             include_injury=payload.include_injury,
+            pitcher_name=payload.pitcher_name,
+            venue=payload.venue,
+            wind_mph=payload.wind_mph,
+            wind_direction=payload.wind_direction,
+            temperature_f=payload.temperature_f,
+            altitude_ft=payload.altitude_ft,
         )
         return {"ok": True, "request_id": request_id, "data": result, "error": None}
     except HTTPException as exc:

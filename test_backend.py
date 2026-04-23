@@ -173,3 +173,188 @@ def test_collect_nba_from_espn_payload_points_and_combo():
 
     vals_combo, _, _, _, _ = app._collect_nba_from_espn_payload(payload, "pts+reb+ast", "")
     assert vals_combo == [45.0, 41.0]
+
+
+def test_parse_rotowire_daily_lineups_extracts_teams_pitchers_and_status():
+    html = """
+    <div>12:10 PM ET</div>
+    <div>Alerts</div>
+    <div>STL</div>
+    <div>MIA</div>
+    <div>Cardinals (14-10) Marlins (12-13)</div>
+    <div>Kyle Leahy</div>
+    <div>R</div>
+    <div>2-2 5.21 ERA</div>
+    <div>Confirmed Lineup</div>
+    <div>2B</div><div>J. Wetherholt</div><div>L</div>
+    <div>DH</div><div>Ivan Herrera</div><div>R</div>
+    <div>Home Run Odds</div>
+    <div>Starting Pitcher Intel</div>
+    <div>Janson Junk</div>
+    <div>R</div>
+    <div>0-2 4.50 ERA</div>
+    <div>Expected Lineup</div>
+    <div>CF</div><div>Jakob Marsee</div><div>L</div>
+    <div>DH</div><div>X. Edwards</div><div>S</div>
+    <div>Home Run Odds</div>
+    <div>Starting Pitcher Intel</div>
+    <div>Umpire: Alex Tosi 9.0 R/G 17.5 K/G</div>
+    <div>0% 57° Wind 6 mph L-R</div>
+    """
+    games = app._parse_rotowire_daily_lineups(html)
+    assert len(games) == 1
+    game = games[0]
+    assert game["away"]["team"] == "STL"
+    assert game["home"]["team"] == "MIA"
+    assert game["away"]["pitcher"]["name"] == "Kyle Leahy"
+    assert game["home"]["pitcher"]["name"] == "Janson Junk"
+    assert game["away"]["status"] == "Confirmed Lineup"
+    assert game["home"]["status"] == "Expected Lineup"
+    assert game["umpire"]["strikeouts_per_game"] == 17.5
+    assert game["weather"]["wind_mph"] == 6.0
+    assert game["away"]["players"][0]["name"] == "J. Wetherholt"
+    assert game["home"]["players"][1]["hand"] == "S"
+
+
+def test_score_pitcher_prop_candidates_gives_high_strikeout_score_when_whiff_profile_is_elite():
+    snapshot = {
+        "pitcher": {
+            "k_pct": 31.2,
+            "bb_pct": 4.8,
+            "k_bb_pct": 26.4,
+            "swstr_pct": 15.9,
+            "csw_pct": 33.4,
+            "fstrike_pct": 65.1,
+            "xera": 3.08,
+            "hard_hit_pct": 31.2,
+            "whip": 1.01,
+            "siera": 3.02,
+            "era": 2.94,
+            "ev": 85.8,
+            "primary_pitch": {
+                "code": "FF",
+                "description": "Four-Seam Fastball",
+                "usage_pct": 37.5,
+                "velocity": 97.6,
+                "spin_rate": 2475.0,
+                "extension": 6.8,
+            },
+        },
+        "lineup": {
+            "confirmed": True,
+            "status": "Confirmed Lineup",
+            "avg_hitter_k_pct": 26.3,
+            "avg_hitter_bb_pct": 6.8,
+            "avg_obp": 0.303,
+            "avg_vs_primary_pitch": 0.214,
+            "avg_k_vs_primary_pitch": 31.1,
+        },
+        "opponent_team": {
+            "strikeouts_per_game": 9.7,
+            "walks_per_game": 2.8,
+            "runs_per_game": 3.8,
+            "ops": 0.664,
+        },
+        "context": {
+            "umpire": {"strikeouts_per_game": 18.5, "runs_per_game": 8.1},
+            "environment": {"altitude_ft": 250.0, "wind_mph": 8.0, "wind_direction": "in", "temperature_f": 58.0},
+        },
+        "opponent": "MIA",
+    }
+    candidates = app._score_pitcher_prop_candidates(snapshot)
+    score_map = {item["bet_type"]: item["score"] for item in candidates}
+    assert score_map["strikeouts_over"] > 80
+    assert score_map["strikeouts_over"] > score_map["walks_under"]
+    assert candidates[0]["score"] >= candidates[-1]["score"]
+
+
+def test_player_name_matches_handles_initials():
+    assert app._player_name_matches("P. Skenes", "Paul Skenes") is True
+    assert app._player_name_matches("Tarik Skubal", "Tarik Skubal") is True
+    assert app._player_name_matches("T. Skubal", "Paul Skenes") is False
+
+
+def test_parse_pitcher_market_rows_groups_over_under_pairs():
+    payload = {
+        "bookmakers": [
+            {
+                "key": "draftkings",
+                "title": "DraftKings",
+                "markets": [
+                    {
+                        "key": "pitcher_strikeouts",
+                        "last_update": "2026-04-22T15:00:00Z",
+                        "outcomes": [
+                            {"name": "Over", "description": "Paul Skenes", "price": -115, "point": 7.5},
+                            {"name": "Under", "description": "Paul Skenes", "price": -105, "point": 7.5},
+                            {"name": "Over", "description": "Tarik Skubal", "price": -120, "point": 6.5},
+                            {"name": "Under", "description": "Tarik Skubal", "price": 100, "point": 6.5},
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    rows = app._parse_pitcher_market_rows(payload, pitcher_name="Paul Skenes")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["market_key"] == "pitcher_strikeouts"
+    assert row["line"] == 7.5
+    assert row["over_odds"] == -115
+    assert row["under_odds"] == -105
+
+
+def test_project_pitcher_market_means_returns_main_props():
+    snapshot = {
+        "pitcher": {
+            "name": "Paul Skenes",
+            "k_pct": 31.2,
+            "bb_pct": 4.8,
+            "k_bb_pct": 26.4,
+            "swstr_pct": 15.9,
+            "csw_pct": 33.4,
+            "fstrike_pct": 65.1,
+            "xera": 3.08,
+            "hard_hit_pct": 31.2,
+            "whip": 1.01,
+            "siera": 3.02,
+            "era": 2.94,
+            "ev": 85.8,
+            "k_per_9": 11.3,
+            "bb_per_9": 2.1,
+            "hits_per_9": 6.9,
+            "ip_per_start": 6.1,
+            "primary_pitch": {
+                "code": "FF",
+                "description": "Four-Seam Fastball",
+                "usage_pct": 37.5,
+                "velocity": 97.6,
+                "spin_rate": 2475.0,
+                "extension": 6.8,
+            },
+        },
+        "lineup": {
+            "confirmed": True,
+            "status": "Confirmed Lineup",
+            "avg_hitter_k_pct": 26.3,
+            "avg_hitter_bb_pct": 6.8,
+            "avg_obp": 0.303,
+            "avg_vs_primary_pitch": 0.214,
+            "avg_k_vs_primary_pitch": 31.1,
+        },
+        "opponent_team": {
+            "strikeouts_per_game": 9.7,
+            "walks_per_game": 2.8,
+            "runs_per_game": 3.8,
+            "ops": 0.664,
+        },
+        "context": {
+            "umpire": {"strikeouts_per_game": 18.5, "runs_per_game": 8.1},
+            "environment": {"altitude_ft": 250.0, "wind_mph": 8.0, "wind_direction": "in", "temperature_f": 58.0},
+        },
+    }
+    projections = app._project_pitcher_market_means(snapshot)
+    assert projections["pitcher_outs"]["expected_stat"] > 16
+    assert projections["pitcher_strikeouts"]["expected_stat"] > projections["pitcher_walks"]["expected_stat"]
+    over_prob, under_prob = app._pitch_market_probabilities(projections["pitcher_strikeouts"]["expected_stat"], 7.5, projections["pitcher_strikeouts"]["std_dev"])
+    assert over_prob > under_prob

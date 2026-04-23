@@ -3770,6 +3770,16 @@ def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, mi
                 continue
             pitcher_metrics = snapshot.get("pitcher") or {}
             lineup_summary = snapshot.get("lineup") or {}
+            projections = _project_pitcher_market_means(snapshot, prop_candidates=prop_candidates)
+            model_market_key = next(
+                (
+                    market_key
+                    for market_key, market_meta in MLB_PITCH_ODDS_MARKETS.items()
+                    if market_meta.get("preferred_bet_type") == best.get("bet_type")
+                ),
+                "",
+            )
+            model_projection = projections.get(model_market_key, {}) if model_market_key else {}
             recommendations.append(
                 {
                     "pitcher": pitcher_metrics.get("name"),
@@ -3780,6 +3790,10 @@ def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, mi
                     "lean": best.get("lean"),
                     "score": best.get("score"),
                     "confidence": _pitch_prop_confidence_label(float(best.get("score") or 0.0)),
+                    "market_key": model_market_key,
+                    "market_name": (MLB_PITCH_ODDS_MARKETS.get(model_market_key) or {}).get("display_name") or str(best.get("bet_type") or "").replace("_", " ").title(),
+                    "expected_stat": model_projection.get("expected_stat"),
+                    "projection_std_dev": model_projection.get("std_dev"),
                     "components": best.get("components"),
                     "all_prop_scores": {item["bet_type"]: item["score"] for item in prop_candidates},
                     "lineup_status": lineup_summary.get("status") or "team-stat fallback",
@@ -3798,10 +3812,13 @@ def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, mi
                     "lineup_summary": {
                         "avg_hitter_k_pct": lineup_summary.get("avg_hitter_k_pct"),
                         "avg_hitter_bb_pct": lineup_summary.get("avg_hitter_bb_pct"),
+                        "avg_obp": lineup_summary.get("avg_obp"),
                         "avg_vs_primary_pitch": lineup_summary.get("avg_vs_primary_pitch"),
                         "avg_k_vs_primary_pitch": lineup_summary.get("avg_k_vs_primary_pitch"),
                         "handedness": lineup_summary.get("handedness"),
+                        "players": lineup_summary.get("players", [])[:9],
                     },
+                    "context": snapshot.get("context"),
                     "reasons": _pitch_prop_reasons(snapshot, best),
                     "sources": snapshot.get("sources"),
                 }

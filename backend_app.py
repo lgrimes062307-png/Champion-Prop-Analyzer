@@ -3835,7 +3835,7 @@ def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, mi
         "min_score": min_score,
         "qualified_count": len(qualified_recommendations),
         "fallback_used": not bool(qualified_recommendations) and bool(all_recommendations),
-        "message": "No pitchers cleared the minimum score; showing the best available model-ranked pitchers." if not qualified_recommendations and all_recommendations else "",
+        "message": "Showing the top available model-ranked pitchers for this slate." if all_recommendations else "",
         "recommendations": returned_recommendations[: max(1, int(limit))],
         "data_sources": {
             "fangraphs": "legacy leaderboards types 1, 5, and 24",

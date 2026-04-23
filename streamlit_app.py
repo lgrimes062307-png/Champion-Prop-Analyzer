@@ -1574,7 +1574,7 @@ with tab_pitch:
         pitch_lab_limit = int(st.slider("Results", min_value=5, max_value=30, value=15, step=1, key="pitch_lab_limit"))
     with ctl_d:
         pitch_lab_min_score = float(
-            st.slider("Minimum Score", min_value=40.0, max_value=85.0, value=55.0, step=1.0, key="pitch_lab_min_score")
+            st.slider("Minimum Score", min_value=0.0, max_value=85.0, value=0.0, step=1.0, key="pitch_lab_min_score")
         )
 
     load_pitch_lab = st.button("Load Pitch Lab", use_container_width=True, key="pitch_lab_load")
@@ -1596,6 +1596,8 @@ with tab_pitch:
 
     if model_error:
         st.warning(f"Pitch Lab unavailable: {model_error}")
+    elif model_payload.get("fallback_used"):
+        st.info(model_payload.get("message") or "Showing the best available pitcher rankings because nobody cleared the current score threshold.")
     if not model_rows and not model_error:
         st.info("Load a slate to see ranked pitcher props, matchup visuals, and source checks.")
 
@@ -1639,7 +1641,7 @@ with tab_pitch:
                 ("Pitchers Ranked", str(len(model_rows))),
                 ("Strong Leans", str(strong_count)),
                 ("Avg Score", _safe_num(avg_score, 1)),
-                ("Confirmed Lineups", _safe_pct(confirmed_rate)),
+                ("Qualified", str(model_payload.get("qualified_count", len(model_rows)))),
             ]
         )
 

@@ -1636,9 +1636,12 @@ with tab_pitch:
     model_error = st.session_state.get("pitch_lab_model_error") or ""
     edge_rows = edge_payload.get("recommendations") or []
     model_rows = model_payload.get("recommendations") or []
+    odds_enabled = edge_payload.get("odds_enabled", True)
 
     if edge_error:
         st.warning(f"Market edges unavailable: {edge_error}")
+    elif odds_enabled is False:
+        st.info(edge_payload.get("message") or "Sportsbook market edges are disabled. Model Board rankings are still available.")
     if model_error:
         st.warning(f"Model board unavailable: {model_error}")
     if not edge_rows and not model_rows and not edge_error and not model_error:
@@ -1725,7 +1728,7 @@ with tab_pitch:
                     }
                 )
             _render_table(edge_table_rows, max_rows=50)
-    elif not edge_error and st.session_state.get("pitch_lab_edge_payload") is not None:
+    elif odds_enabled is not False and not edge_error and st.session_state.get("pitch_lab_edge_payload") is not None:
         st.info("No priced edges met the current threshold. Lower Min Edge % or check another bookmaker.")
 
     if model_rows:

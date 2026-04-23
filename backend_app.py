@@ -3583,12 +3583,30 @@ def build_mlb_pitcher_market_edges(
     min_edge_pct: float = 2.0,
     limit: int = 20,
 ) -> Dict[str, Any]:
-    if not ODDS_API_KEY:
-        raise HTTPException(status_code=400, detail="ODDS_API_KEY not configured")
     sport_key = _odds_sport_key("mlb")
     market_keys = [m.strip() for m in str(markets or MLB_DEFAULT_PITCH_MARKETS).split(",") if m.strip() in MLB_PITCH_ODDS_MARKETS]
     if not market_keys:
         raise HTTPException(status_code=400, detail="No supported MLB pitcher markets requested")
+    if not ODDS_API_KEY:
+        return {
+            "sport": "mlb",
+            "date": game_date.isoformat(),
+            "season_year": season_year,
+            "bookmaker": bookmaker,
+            "regions": regions,
+            "markets": market_keys,
+            "model_version": MODEL_VERSION,
+            "pitchers_scanned": 0,
+            "market_rows_scanned": 0,
+            "count": 0,
+            "recommendations": [],
+            "odds_enabled": False,
+            "message": "No ODDS_API_KEY configured, so market-edge pricing is disabled. Use the Model Board for no-key pitcher rankings.",
+            "source_timestamp": _now_iso(),
+            "data_sources": {
+                "odds_api": "disabled because ODDS_API_KEY is not configured",
+            },
+        }
 
     rotowire_index = _rotowire_lineup_index(game_date)
     schedule_games = _mlb_schedule_games_for_date(game_date)

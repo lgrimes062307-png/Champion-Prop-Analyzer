@@ -6,8 +6,12 @@ from nba_api.stats.static import players, teams
 from pydantic import BaseModel
 import datetime
 import hashlib
+from html.parser import HTMLParser
+from io import StringIO
+import math
 import os
 import random
+import re
 import time
 import threading
 import sqlite3
@@ -303,6 +307,132 @@ NBA_HEADERS = {
     "Referer": "https://www.nba.com/",
     "Origin": "https://www.nba.com",
 }
+WEB_SCRAPE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+MLB_PITCH_PROP_WEIGHTS = {
+    "strikeouts_over": {
+        "pitcher_skill": 0.36,
+        "pitch_quality": 0.18,
+        "opponent_profile": 0.22,
+        "pitch_matchup": 0.14,
+        "context": 0.10,
+    },
+    "walks_under": {
+        "pitcher_skill": 0.40,
+        "pitch_quality": 0.10,
+        "opponent_profile": 0.28,
+        "pitch_matchup": 0.07,
+        "context": 0.15,
+    },
+    "earned_runs_under": {
+        "pitcher_skill": 0.32,
+        "pitch_quality": 0.08,
+        "opponent_profile": 0.30,
+        "pitch_matchup": 0.12,
+        "context": 0.18,
+    },
+    "hits_allowed_under": {
+        "pitcher_skill": 0.30,
+        "pitch_quality": 0.12,
+        "opponent_profile": 0.28,
+        "pitch_matchup": 0.15,
+        "context": 0.15,
+    },
+    "outs_recorded_over": {
+        "pitcher_skill": 0.34,
+        "pitch_quality": 0.10,
+        "opponent_profile": 0.28,
+        "pitch_matchup": 0.10,
+        "context": 0.18,
+    },
+}
+MLB_PITCH_ODDS_MARKETS = {
+    "pitcher_strikeouts": {
+        "prop_key": "strikeouts",
+        "display_name": "Pitcher Strikeouts",
+        "preferred_bet_type": "strikeouts_over",
+        "std_dev": 1.85,
+    },
+    "pitcher_walks": {
+        "prop_key": "walks",
+        "display_name": "Pitcher Walks",
+        "preferred_bet_type": "walks_under",
+        "std_dev": 1.05,
+    },
+    "pitcher_earned_runs": {
+        "prop_key": "earned_runs",
+        "display_name": "Pitcher Earned Runs",
+        "preferred_bet_type": "earned_runs_under",
+        "std_dev": 1.25,
+    },
+    "pitcher_hits_allowed": {
+        "prop_key": "hits_allowed",
+        "display_name": "Pitcher Hits Allowed",
+        "preferred_bet_type": "hits_allowed_under",
+        "std_dev": 1.65,
+    },
+    "pitcher_outs": {
+        "prop_key": "outs_recorded",
+        "display_name": "Pitcher Outs Recorded",
+        "preferred_bet_type": "outs_recorded_over",
+        "std_dev": 2.4,
+    },
+}
+MLB_DEFAULT_PITCH_MARKETS = ",".join(MLB_PITCH_ODDS_MARKETS.keys())
+ROTOWIRE_LINEUP_STATUSES = {"Confirmed Lineup", "Expected Lineup", "Unknown Lineup"}
+ROTOWIRE_POSITION_TOKENS = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH", "P"}
+ROTOWIRE_HAND_TOKENS = {"L", "R", "S"}
+MLB_PITCH_CODE_ALIASES = {
+    "FA": "FF",
+    "FO": "FS",
+    "EP": "CS",
+    "SC": "ST",
+}
+SAVANT_PITCH_QUERY_TEMPLATE = {
+    "batter_stands": "",
+    "chk_pitch_type": "on",
+    "chk_stats_release_extension": "on",
+    "chk_stats_spin_rate": "on",
+    "chk_stats_velocity": "on",
+    "game_date_gt": "",
+    "game_date_lt": "",
+    "group_by": "name-year",
+    "hfAB": "",
+    "hfBBL": "",
+    "hfBBT": "",
+    "hfC": "",
+    "hfFlag": "",
+    "hfGT": "R|",
+    "hfInfield": "",
+    "hfInn": "",
+    "hfMo": "",
+    "hfNewZones": "",
+    "hfOpponent": "",
+    "hfOutfield": "",
+    "hfOuts": "",
+    "hfPR": "",
+    "hfPull": "",
+    "hfRO": "",
+    "hfSA": "",
+    "hfSit": "",
+    "hfStadium": "",
+    "hfTeam": "",
+    "hfZ": "",
+    "home_road": "",
+    "metric_1": "",
+    "min_pas": 0,
+    "min_pitches": 0,
+    "min_results": 0,
+    "pitcher_throws": "",
+    "player_event_sort": "api_p_release_speed",
+    "player_type": "pitcher",
+    "position": "",
+    "sort_col": "velocity",
+    "sort_order": "desc",
+}
 _provider_state: Dict[str, dict] = {}
 _provider_lock = threading.Lock()
 _provider_fail_threshold = int(os.getenv("PROVIDER_FAIL_THRESHOLD", "4"))
@@ -406,6 +536,12 @@ def _now_iso():
 def _provider_name_from_url(url: str):
     if "statsapi.mlb.com" in url:
         return "mlb_statsapi"
+    if "fangraphs.com" in url:
+        return "fangraphs"
+    if "rotowire.com" in url:
+        return "rotowire"
+    if "baseballsavant.mlb.com" in url:
+        return "baseballsavant"
     if "espn.com" in url:
         return "espn"
     if "balldontlie.io" in url:
@@ -748,6 +884,175 @@ def _mean(values: List[float]) -> float:
     if not values:
         return 0.0
     return round(sum(values) / len(values), 2)
+
+
+def _percent_value(value) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text in ("--", "nan"):
+            return None
+        if text.endswith("%"):
+            return _safe_float(text[:-1], None)
+    return _safe_float(value, None)
+
+
+def _score_band(value: Optional[float], low: float, high: float, higher_is_better: bool = True, default: float = 0.5) -> float:
+    if value is None:
+        return default
+    if high < low:
+        low, high = high, low
+    if high <= low:
+        return default
+    scaled = _clamp((float(value) - low) / (high - low), 0.0, 1.0)
+    return scaled if higher_is_better else 1.0 - scaled
+
+
+def _avg_score(*values: Optional[float], default: float = 0.5) -> float:
+    valid = [float(v) for v in values if v is not None]
+    if not valid:
+        return default
+    return sum(valid) / len(valid)
+
+
+def _name_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _team_name_key(name: str) -> str:
+    text = str(name or "").lower()
+    text = text.replace(".", "").replace("'", "")
+    text = text.replace("d-backs", "diamondbacks")
+    text = re.sub(r"[^a-z0-9]+", "", text)
+    return text
+
+
+def _team_short_name_key(name: str) -> str:
+    tokens = [t for t in re.split(r"[\s-]+", str(name or "").lower()) if t]
+    if not tokens:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", tokens[-1])
+
+
+def _parse_baseball_innings(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "." not in text:
+        return _safe_float(text, None)
+    whole, frac = text.split(".", 1)
+    try:
+        whole_int = int(whole)
+    except Exception:
+        return _safe_float(text, None)
+    if frac == "1":
+        return whole_int + (1.0 / 3.0)
+    if frac == "2":
+        return whole_int + (2.0 / 3.0)
+    return _safe_float(text, None)
+
+
+def _player_name_tokens(name: str) -> Tuple[str, str, str]:
+    tokens = [t for t in re.split(r"\s+", str(name or "").replace(".", " ").strip()) if t]
+    if not tokens:
+        return "", "", ""
+    first = tokens[0].lower()
+    last = tokens[-1].lower()
+    return first, first[:1], last
+
+
+def _player_name_matches(candidate: str, target: str) -> bool:
+    c_full = _name_key(candidate)
+    t_full = _name_key(target)
+    if c_full == t_full:
+        return True
+    c_first, c_initial, c_last = _player_name_tokens(candidate)
+    t_first, t_initial, t_last = _player_name_tokens(target)
+    if not c_last or not t_last:
+        return False
+    if c_last != t_last:
+        return False
+    if c_first == t_first and c_first:
+        return True
+    return bool(c_initial and t_initial and c_initial == t_initial)
+
+
+def _normal_cdf(x: float, mean: float, std_dev: float) -> float:
+    if std_dev <= 0:
+        return 0.5 if x == mean else (1.0 if x > mean else 0.0)
+    z = (float(x) - float(mean)) / (float(std_dev) * math.sqrt(2.0))
+    return 0.5 * (1.0 + math.erf(z))
+
+
+def _american_from_probability(prob_pct: Optional[float]) -> Optional[int]:
+    if prob_pct is None:
+        return None
+    prob = max(0.0001, min(99.9999, float(prob_pct))) / 100.0
+    if prob >= 0.5:
+        return int(round(-100.0 * prob / (1.0 - prob)))
+    return int(round(100.0 * (1.0 - prob) / prob))
+
+
+def _ev_units_for_american(prob_pct: Optional[float], american_odds: Optional[int]) -> Optional[float]:
+    if prob_pct is None or american_odds in (None, 0):
+        return None
+    prob = max(0.0, min(1.0, float(prob_pct) / 100.0))
+    odds = int(american_odds)
+    if odds > 0:
+        return round((prob * (odds / 100.0)) - (1.0 - prob), 4)
+    return round((prob * (100.0 / abs(odds))) - (1.0 - prob), 4)
+
+
+def _fetch_text(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> str:
+    provider = _provider_name_from_url(url)
+    if _provider_is_open(provider):
+        raise HTTPException(status_code=503, detail=f"Provider {provider} is temporarily unavailable")
+    last_exc = None
+    retries = max(1, EXTERNAL_HTTP_RETRIES)
+    timeout = max(1.0, EXTERNAL_HTTP_TIMEOUT_SECONDS)
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params or {}, headers=headers or WEB_SCRAPE_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            _provider_note_success(provider)
+            return resp.text
+        except Exception as exc:
+            last_exc = exc
+            _provider_note_failure(provider, f"{type(exc).__name__}: {exc}")
+            if attempt < retries - 1:
+                time.sleep(EXTERNAL_RETRY_BACKOFF_SECONDS * (attempt + 1))
+    raise HTTPException(status_code=502, detail=f"Provider request failed ({provider}): {last_exc}")
+
+
+def _read_html_table_records(html: str, required_columns: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    try:
+        tables = pd.read_html(StringIO(html))
+    except Exception:
+        return []
+    target = None
+    normalized_required = {str(col).strip() for col in required_columns}
+    for df in tables:
+        df.columns = [str(col).strip() for col in df.columns]
+        if normalized_required.issubset(set(df.columns)):
+            target = df
+            break
+    if target is None:
+        return []
+    records: List[Dict[str, Any]] = []
+    for row in target.to_dict(orient="records"):
+        cleaned = {}
+        for key, value in row.items():
+            key_text = str(key).strip()
+            if isinstance(value, str):
+                value = value.replace("\xa0", " ").strip()
+            cleaned[key_text] = value
+        if cleaned.get("Name") in ("Name", "", None) or cleaned.get("Player") in ("Player", "", None):
+            continue
+        records.append(cleaned)
+    return records
 
 
 def _ci_from_values(values: List[float], line: float, op: str):
@@ -1828,6 +2133,15 @@ def _mlb_team_id(abbrev: str) -> Optional[int]:
     return entry.get("id")
 
 
+def _mlb_team_abbrev(team_id: Optional[int]) -> str:
+    if not team_id:
+        return ""
+    for abbrev, entry in _mlb_team_map().items():
+        if int(entry.get("id", 0)) == int(team_id):
+            return abbrev
+    return ""
+
+
 def _mlb_player_profile(player: str) -> Dict[str, Any]:
     player_id = _mlb_find_player_id(player)
     if not player_id:
@@ -1948,6 +2262,46 @@ def _mlb_find_schedule_game(team_id: int, opponent_id: int, season_year: int) ->
     selected = games[0][1]
     _set_cached_external(cache_key, selected)
     return selected
+
+
+def _mlb_schedule_games_for_date(game_date: datetime.date) -> List[Dict[str, Any]]:
+    cache_key = ("mlb_schedule_daily", game_date.isoformat())
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or []
+    data = _fetch_json(
+        "https://statsapi.mlb.com/api/v1/schedule",
+        params={"sportId": 1, "date": game_date.isoformat(), "gameTypes": "R,P"},
+    )
+    games: List[Dict[str, Any]] = []
+    for date_block in data.get("dates", []) if isinstance(data, dict) else []:
+        for game in date_block.get("games", []) or []:
+            teams = game.get("teams") or {}
+            away = teams.get("away") or {}
+            home = teams.get("home") or {}
+            away_team = away.get("team") or {}
+            home_team = home.get("team") or {}
+            game_row = {
+                "game_pk": game.get("gamePk"),
+                "game_date": game.get("gameDate"),
+                "status": ((game.get("status") or {}).get("detailedState") or ""),
+                "venue": ((game.get("venue") or {}).get("name") or ""),
+                "away": {
+                    "id": away_team.get("id"),
+                    "name": away_team.get("name") or away_team.get("teamName") or "",
+                    "abbr": _mlb_team_abbrev(away_team.get("id")),
+                    "probable_pitcher": away.get("probablePitcher") or {},
+                },
+                "home": {
+                    "id": home_team.get("id"),
+                    "name": home_team.get("name") or home_team.get("teamName") or "",
+                    "abbr": _mlb_team_abbrev(home_team.get("id")),
+                    "probable_pitcher": home.get("probablePitcher") or {},
+                },
+            }
+            games.append(game_row)
+    _set_cached_external(cache_key, games)
+    return games
 
 
 def _mlb_probable_pitcher(game: dict, opponent_id: int) -> Optional[dict]:
@@ -2225,6 +2579,211 @@ def _mlb_hitter_pitch_profile(player_id: int, season_year: int) -> Tuple[Dict[st
     return profile, used_year, fallback
 
 
+class _HTMLTextCollector(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tokens: List[str] = []
+
+    def handle_data(self, data: str):
+        text = str(data or "").replace("\xa0", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            self.tokens.append(text)
+
+
+def _token_is_time(value: str) -> bool:
+    return bool(re.match(r"^\d{1,2}:\d{2}\s+(AM|PM)\s+ET$", str(value or "").strip()))
+
+
+def _token_is_team_abbrev(value: str) -> bool:
+    text = str(value or "").strip().upper()
+    if text in {"LINE", "AL", "NL", "O/U"}:
+        return False
+    return bool(re.match(r"^[A-Z]{2,3}$", text))
+
+
+def _parse_rotowire_team_section(tokens: List[str], status_idx: int) -> Dict[str, Any]:
+    status = tokens[status_idx]
+    pitcher_name = ""
+    pitcher_hand = ""
+    for idx in range(max(1, status_idx - 8), status_idx):
+        if idx + 1 < status_idx and tokens[idx + 1] in ROTOWIRE_HAND_TOKENS:
+            pitcher_name = tokens[idx]
+            pitcher_hand = tokens[idx + 1]
+    players = []
+    i = status_idx + 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ROTOWIRE_LINEUP_STATUSES or tok.startswith("Umpire:") or _token_is_time(tok) or tok in ("LINE", "O/U", "Home Run Odds", "Starting Pitcher Intel"):
+            break
+        if tok in ROTOWIRE_POSITION_TOKENS and i + 2 < len(tokens):
+            name = tokens[i + 1]
+            hand = tokens[i + 2] if tokens[i + 2] in ROTOWIRE_HAND_TOKENS else ""
+            players.append({"position": tok, "name": name, "hand": hand})
+            i += 3
+            while i < len(tokens) and (tokens[i].startswith("$") or tokens[i] in ("Home Run Odds", "Starting Pitcher Intel")):
+                if tokens[i] in ("Home Run Odds", "Starting Pitcher Intel"):
+                    break
+                i += 1
+            continue
+        i += 1
+    return {
+        "status": status,
+        "confirmed": status == "Confirmed Lineup",
+        "pitcher": {"name": pitcher_name, "hand": pitcher_hand},
+        "players": players[:9],
+    }
+
+
+def _parse_rotowire_daily_lineups(html: str) -> List[Dict[str, Any]]:
+    parser = _HTMLTextCollector()
+    parser.feed(html or "")
+    tokens = parser.tokens
+    time_indices = [idx for idx, token in enumerate(tokens) if _token_is_time(token)]
+    games: List[Dict[str, Any]] = []
+    for block_idx, start in enumerate(time_indices):
+        end = time_indices[block_idx + 1] if block_idx + 1 < len(time_indices) else len(tokens)
+        block = tokens[start:end]
+        if len(block) < 10:
+            continue
+        teams = [token for token in block[:20] if _token_is_team_abbrev(token)]
+        if len(teams) < 2:
+            continue
+        status_indices = [idx for idx, token in enumerate(block) if token in ROTOWIRE_LINEUP_STATUSES]
+        if len(status_indices) < 2:
+            continue
+        away = _parse_rotowire_team_section(block, status_indices[0])
+        home = _parse_rotowire_team_section(block, status_indices[1])
+        block_text = " ".join(block)
+        umpire_name = ""
+        umpire_runs = None
+        umpire_ks = None
+        weather_match = re.search(r"(\d+)%\s+(\d+)°\s+Wind\s+(\d+)\s+mph\s+([A-Za-z-]+)", block_text)
+        umpire_match = re.search(r"Umpire:\s*(.*?)\s+([0-9.]+)\s+R/G\s+([0-9.]+)\s+K/G", block_text)
+        if umpire_match:
+            umpire_name = umpire_match.group(1).strip()
+            umpire_runs = _safe_float(umpire_match.group(2), None)
+            umpire_ks = _safe_float(umpire_match.group(3), None)
+        weather = {
+            "summary": "Dome In Domed Stadium" if "Dome In Domed Stadium" in block_text else "",
+            "temp_f": _safe_float(weather_match.group(2), None) if weather_match else None,
+            "wind_mph": _safe_float(weather_match.group(3), None) if weather_match else None,
+            "wind_direction": weather_match.group(4).strip() if weather_match else "",
+        }
+        games.append(
+            {
+                "time": block[0],
+                "away": {"team": teams[0], **away},
+                "home": {"team": teams[1], **home},
+                "umpire": {"name": umpire_name, "runs_per_game": umpire_runs, "strikeouts_per_game": umpire_ks},
+                "weather": weather,
+            }
+        )
+    return games
+
+
+def _rotowire_lineups_for_date(game_date: datetime.date) -> List[Dict[str, Any]]:
+    if game_date != datetime.date.today():
+        return []
+    cache_key = ("rotowire_lineups", game_date.isoformat())
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or []
+    html = _fetch_text("https://www.rotowire.com/baseball/daily-lineups.php", params={"site": "Yahoo"}, headers=WEB_SCRAPE_HEADERS)
+    games = _parse_rotowire_daily_lineups(html)
+    _set_cached_external(cache_key, games)
+    return games
+
+
+def _rotowire_lineup_index(game_date: datetime.date) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    for game in _rotowire_lineups_for_date(game_date):
+        for side in ("away", "home"):
+            team_block = game.get(side) or {}
+            team = str(team_block.get("team") or "").upper()
+            if not team:
+                continue
+            index[team] = {
+                "game": {"time": game.get("time"), "umpire": game.get("umpire") or {}, "weather": game.get("weather") or {}},
+                **team_block,
+            }
+    return index
+
+
+def _fangraphs_pitching_table(season_year: int, table_type: int) -> List[Dict[str, Any]]:
+    cache_key = ("fangraphs_pitching_table", season_year, table_type)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or []
+    html = _fetch_text(
+        "https://www.fangraphs.com/leaders-legacy.aspx",
+        params={"lg": "all", "pos": "all", "qual": 0, "season": season_year, "stats": "pit", "team": 0, "type": table_type},
+        headers=WEB_SCRAPE_HEADERS,
+    )
+    required = {
+        1: ("Name", "Team", "K%", "BB%"),
+        5: ("Name", "Team", "SwStr%", "CStr%", "CSW%"),
+        24: ("Name", "Team", "EV", "HardHit%", "xERA"),
+    }.get(table_type, ("Name", "Team"))
+    rows = _read_html_table_records(html, required)
+    _set_cached_external(cache_key, rows)
+    return rows
+
+
+def _find_named_metric_row(rows: List[Dict[str, Any]], player_name: str, team_abbrev: str = "") -> Dict[str, Any]:
+    key = _name_key(player_name)
+    team = str(team_abbrev or "").upper()
+    candidates = [row for row in rows if _name_key(row.get("Name") or row.get("Player")) == key]
+    if not candidates:
+        return {}
+    if team:
+        for row in candidates:
+            if str(row.get("Team") or "").upper() == team:
+                return row
+    return candidates[0]
+
+
+def _fangraphs_pitcher_snapshot(player_name: str, team_abbrev: str, season_year: int) -> Dict[str, Any]:
+    advanced = _find_named_metric_row(_fangraphs_pitching_table(season_year, 1), player_name, team_abbrev)
+    plate = _find_named_metric_row(_fangraphs_pitching_table(season_year, 5), player_name, team_abbrev)
+    statcast = _find_named_metric_row(_fangraphs_pitching_table(season_year, 24), player_name, team_abbrev)
+    return {
+        "advanced": advanced,
+        "plate_discipline": plate,
+        "statcast": statcast,
+    }
+
+
+def _baseballsavant_pitch_table(pitch_code: str, season_year: int) -> List[Dict[str, Any]]:
+    normalized_code = MLB_PITCH_CODE_ALIASES.get(str(pitch_code or "").upper(), str(pitch_code or "").upper())
+    if not normalized_code:
+        return []
+    cache_key = ("baseballsavant_pitch_table", normalized_code, season_year)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or []
+    params = dict(SAVANT_PITCH_QUERY_TEMPLATE)
+    params["hfPT"] = f"{normalized_code}|"
+    params["hfSea"] = f"{season_year}|"
+    html = _fetch_text("https://baseballsavant.mlb.com/statcast_search", params=params, headers=WEB_SCRAPE_HEADERS)
+    rows = _read_html_table_records(html, ("Player", "Year", "Pitches"))
+    _set_cached_external(cache_key, rows)
+    return rows
+
+
+def _baseballsavant_primary_pitch_snapshot(player_name: str, pitch_code: str, season_year: int) -> Dict[str, Any]:
+    row = _find_named_metric_row(_baseballsavant_pitch_table(pitch_code, season_year), player_name, "")
+    if not row:
+        return {}
+    return {
+        "pitch_code": str(pitch_code or "").upper(),
+        "velocity": _safe_float(row.get("Pitch (MPH)") or row.get("Pitch (MPH) "), None),
+        "spin_rate": _safe_float(row.get("Spin Rate") or row.get("Spin Rate (RPM)") or row.get("Spin (RPM)"), None),
+        "extension": _safe_float(row.get("Extension (ft)") or row.get("Extension"), None),
+        "pitch_pct": _safe_float(row.get("Pitch %"), None),
+        "pitches": _safe_float(row.get("Pitches"), None),
+    }
+
 def _mlb_pitch_match_factor(prop: str, pitch_stats: Dict[str, Any]) -> float:
     if not pitch_stats:
         return 0.0
@@ -2296,6 +2855,957 @@ def _mlb_stat_float(stats: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[fl
             if val is not None:
                 return val
     return None
+
+
+def _team_stat_per_game(stats: Dict[str, Any], total_keys: Tuple[str, ...]) -> Optional[float]:
+    games = _mlb_stat_float(stats, ("gamesPlayed", "games", "g"))
+    total = _mlb_stat_float(stats, total_keys)
+    if not games or total is None:
+        return None
+    if float(games) <= 0:
+        return None
+    return float(total) / float(games)
+
+
+def _lineup_summary_for_pitcher(lineup_info: Dict[str, Any], primary_pitch: Dict[str, Any], season_year: int) -> Dict[str, Any]:
+    players = lineup_info.get("players") or []
+    hitter_rows = []
+    k_rates = []
+    bb_rates = []
+    obp_values = []
+    avg_vs_pitch = []
+    k_vs_pitch = []
+    hand_counts = {"L": 0, "R": 0, "S": 0}
+    for hitter in players:
+        hand = str(hitter.get("hand") or "").upper()
+        if hand in hand_counts:
+            hand_counts[hand] += 1
+        player_name = str(hitter.get("name") or "").strip()
+        if not player_name:
+            continue
+        pid = _mlb_find_player_id(player_name)
+        pitch_stats = {}
+        if pid:
+            stats, _, _ = _mlb_player_stats_with_fallback(int(pid), "hitting", season_year)
+            pa = _mlb_stat_float(stats, ("plateAppearances",))
+            strikeouts = _mlb_stat_float(stats, ("strikeOuts", "strikeouts"))
+            walks = _mlb_stat_float(stats, ("baseOnBalls", "walks"))
+            obp = _mlb_stat_float(stats, ("obp", "onBasePercentage"))
+            hitter_k_pct = (float(strikeouts) / float(pa) * 100.0) if pa and strikeouts is not None else None
+            hitter_bb_pct = (float(walks) / float(pa) * 100.0) if pa and walks is not None else None
+            if hitter_k_pct is not None:
+                k_rates.append(hitter_k_pct)
+            if hitter_bb_pct is not None:
+                bb_rates.append(hitter_bb_pct)
+            if obp is not None:
+                obp_values.append(obp)
+            if primary_pitch.get("code"):
+                pitch_profile, _, _ = _mlb_hitter_pitch_profile(int(pid), season_year)
+                pitch_stats = pitch_profile.get(str(primary_pitch.get("code")).upper(), {})
+                pitch_avg = _safe_float(pitch_stats.get("avg"), None)
+                pitch_k = _safe_float(pitch_stats.get("k_rate"), None)
+                if pitch_avg is not None:
+                    avg_vs_pitch.append(float(pitch_avg))
+                if pitch_k is not None:
+                    k_vs_pitch.append(float(pitch_k) * 100.0)
+        hitter_rows.append(
+            {
+                "name": player_name,
+                "hand": hand,
+                "position": hitter.get("position"),
+                "avg_vs_primary_pitch": round(_safe_float(pitch_stats.get("avg"), None), 3) if pitch_stats and pitch_stats.get("avg") is not None else None,
+                "k_rate_vs_primary_pitch": round(_safe_float(pitch_stats.get("k_rate"), None) * 100.0, 2) if pitch_stats and pitch_stats.get("k_rate") is not None else None,
+            }
+        )
+    return {
+        "status": lineup_info.get("status") or "",
+        "confirmed": bool(lineup_info.get("confirmed")),
+        "player_count": len(players),
+        "avg_hitter_k_pct": round(sum(k_rates) / len(k_rates), 2) if k_rates else None,
+        "avg_hitter_bb_pct": round(sum(bb_rates) / len(bb_rates), 2) if bb_rates else None,
+        "avg_obp": round(sum(obp_values) / len(obp_values), 3) if obp_values else None,
+        "avg_vs_primary_pitch": round(sum(avg_vs_pitch) / len(avg_vs_pitch), 3) if avg_vs_pitch else None,
+        "avg_k_vs_primary_pitch": round(sum(k_vs_pitch) / len(k_vs_pitch), 2) if k_vs_pitch else None,
+        "handedness": hand_counts,
+        "players": hitter_rows,
+    }
+
+
+def _metric_bundle_for_pitcher(
+    pitcher_name: str,
+    pitcher_team: str,
+    pitcher_profile: Dict[str, Any],
+    statsapi_stats: Dict[str, Any],
+    fangraphs: Dict[str, Any],
+    primary_pitch: Dict[str, Any],
+    savant_pitch: Dict[str, Any],
+) -> Dict[str, Any]:
+    advanced = fangraphs.get("advanced") or {}
+    plate = fangraphs.get("plate_discipline") or {}
+    statcast = fangraphs.get("statcast") or {}
+    batters_faced = _mlb_stat_float(statsapi_stats, ("battersFaced",))
+    strikeouts = _mlb_stat_float(statsapi_stats, ("strikeOuts", "strikeouts"))
+    walks = _mlb_stat_float(statsapi_stats, ("baseOnBalls", "walks"))
+    innings_pitched = _parse_baseball_innings(statsapi_stats.get("inningsPitched"))
+    games_started = _mlb_stat_float(statsapi_stats, ("gamesStarted", "gamesStartedAsStarter"))
+    k_pct = _percent_value(advanced.get("K%"))
+    if k_pct is None and batters_faced and strikeouts is not None:
+        k_pct = round((float(strikeouts) / float(batters_faced)) * 100.0, 2)
+    bb_pct = _percent_value(advanced.get("BB%"))
+    if bb_pct is None and batters_faced and walks is not None:
+        bb_pct = round((float(walks) / float(batters_faced)) * 100.0, 2)
+    k_bb_pct = _percent_value(advanced.get("K-BB%"))
+    if k_bb_pct is None and k_pct is not None and bb_pct is not None:
+        k_bb_pct = round(k_pct - bb_pct, 2)
+    return {
+        "name": pitcher_name,
+        "team": pitcher_team,
+        "pitch_hand": pitcher_profile.get("pitch_hand"),
+        "k_pct": k_pct,
+        "bb_pct": bb_pct,
+        "k_bb_pct": k_bb_pct,
+        "bb_per_9": _safe_float(advanced.get("BB/9"), _mlb_stat_float(statsapi_stats, ("baseOnBallsPer9Inn", "walksPer9Inn"))),
+        "k_per_9": _safe_float(advanced.get("K/9"), _mlb_stat_float(statsapi_stats, ("strikeoutsPer9Inn", "strikeOutsPer9Inn"))),
+        "hits_per_9": _mlb_stat_float(statsapi_stats, ("hitsPer9Inn",)),
+        "siera": _safe_float(advanced.get("SIERA"), None),
+        "swstr_pct": _percent_value(plate.get("SwStr%")),
+        "cstr_pct": _percent_value(plate.get("CStr%")),
+        "csw_pct": _percent_value(plate.get("CSW%")),
+        "fstrike_pct": _percent_value(plate.get("F-Strike%")),
+        "era": _safe_float(advanced.get("ERA"), _mlb_stat_float(statsapi_stats, ("era",))),
+        "whip": _safe_float(advanced.get("WHIP"), _mlb_stat_float(statsapi_stats, ("whip",))),
+        "hr_per_9": _safe_float(advanced.get("HR/9"), _mlb_stat_float(statsapi_stats, ("homeRunsPer9", "homeRunsPer9Inn"))),
+        "xera": _safe_float(statcast.get("xERA"), None),
+        "ev": _safe_float(statcast.get("EV"), None),
+        "hard_hit_pct": _percent_value(statcast.get("HardHit%")),
+        "innings_pitched": innings_pitched,
+        "games_started": games_started,
+        "ip_per_start": round(float(innings_pitched) / float(games_started), 2) if innings_pitched and games_started else None,
+        "primary_pitch": {
+            "code": primary_pitch.get("code"),
+            "description": primary_pitch.get("description"),
+            "usage_pct": primary_pitch.get("usage_pct"),
+            "velocity": savant_pitch.get("velocity") if savant_pitch.get("velocity") is not None else primary_pitch.get("avg_speed"),
+            "spin_rate": savant_pitch.get("spin_rate"),
+            "extension": savant_pitch.get("extension"),
+        },
+        "source_flags": {
+            "fangraphs": bool(advanced or plate or statcast),
+            "baseballsavant": bool(savant_pitch),
+            "statsapi": bool(statsapi_stats),
+        },
+    }
+
+
+def _context_score_from_environment(prop: str, altitude_ft: Optional[float], wind_mph: Optional[float], wind_direction: str, temperature_f: Optional[float]) -> float:
+    raw = _mlb_environment_factor(prop, "pitcher", altitude_ft, wind_mph, wind_direction, temperature_f)
+    return _clamp((raw + 0.10) / 0.20, 0.0, 1.0)
+
+
+def _score_pitcher_prop_candidates(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    pitcher = snapshot.get("pitcher") or {}
+    lineup = snapshot.get("lineup") or {}
+    opponent = snapshot.get("opponent_team") or {}
+    context = snapshot.get("context") or {}
+    primary_pitch = pitcher.get("primary_pitch") or {}
+    confirmed_boost = 1.0 if lineup.get("confirmed") else 0.58
+    opponent_k_pg = opponent.get("strikeouts_per_game")
+    opponent_bb_pg = opponent.get("walks_per_game")
+    opponent_runs_pg = opponent.get("runs_per_game")
+    opponent_ops = opponent.get("ops")
+    umpire_ks = (context.get("umpire") or {}).get("strikeouts_per_game")
+    umpire_runs = (context.get("umpire") or {}).get("runs_per_game")
+    env = context.get("environment") or {}
+
+    component_scores = {
+        "strikeouts_over": {
+            "pitcher_skill": _avg_score(
+                _score_band(pitcher.get("k_pct"), 14.0, 32.0),
+                _score_band(pitcher.get("k_bb_pct"), 7.0, 26.0),
+                _score_band(pitcher.get("swstr_pct"), 8.0, 18.0),
+                _score_band(pitcher.get("csw_pct"), 26.0, 35.0),
+                _score_band(pitcher.get("bb_pct"), 11.0, 4.0, higher_is_better=False),
+            ),
+            "pitch_quality": _avg_score(
+                _score_band(primary_pitch.get("velocity"), 88.0, 99.0),
+                _score_band(primary_pitch.get("spin_rate"), 1900.0, 2900.0),
+                _score_band(primary_pitch.get("extension"), 5.5, 7.2),
+                _score_band(primary_pitch.get("usage_pct"), 18.0, 45.0),
+            ),
+            "opponent_profile": _avg_score(
+                _score_band(lineup.get("avg_hitter_k_pct"), 18.0, 28.0),
+                _score_band(opponent_k_pg, 6.8, 10.5),
+                _score_band(umpire_ks, 15.5, 19.0),
+                confirmed_boost,
+            ),
+            "pitch_matchup": _avg_score(
+                _score_band(lineup.get("avg_k_vs_primary_pitch"), 18.0, 35.0),
+                _score_band(lineup.get("avg_vs_primary_pitch"), 0.310, 0.210, higher_is_better=False),
+            ),
+            "context": _avg_score(
+                _context_score_from_environment("strikeouts", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")),
+                _score_band(pitcher.get("xera"), 5.3, 2.8, higher_is_better=False),
+                _score_band(pitcher.get("hard_hit_pct"), 47.0, 30.0, higher_is_better=False),
+            ),
+        },
+        "walks_under": {
+            "pitcher_skill": _avg_score(
+                _score_band(pitcher.get("bb_pct"), 11.0, 3.0, higher_is_better=False),
+                _score_band(pitcher.get("bb_per_9"), 4.4, 1.5, higher_is_better=False),
+                _score_band(pitcher.get("fstrike_pct"), 54.0, 67.0),
+                _score_band(pitcher.get("csw_pct"), 25.0, 35.0),
+            ),
+            "pitch_quality": _avg_score(
+                _score_band(primary_pitch.get("extension"), 5.5, 7.1),
+                _score_band(primary_pitch.get("velocity"), 88.0, 99.0),
+            ),
+            "opponent_profile": _avg_score(
+                _score_band(lineup.get("avg_hitter_bb_pct"), 10.5, 5.5, higher_is_better=False),
+                _score_band(opponent_bb_pg, 4.5, 2.4, higher_is_better=False),
+                _score_band(opponent.get("ops"), 0.830, 0.650, higher_is_better=False),
+                confirmed_boost,
+            ),
+            "pitch_matchup": _avg_score(
+                _score_band(lineup.get("avg_vs_primary_pitch"), 0.310, 0.215, higher_is_better=False),
+                _score_band(lineup.get("avg_k_vs_primary_pitch"), 16.0, 33.0),
+            ),
+            "context": _avg_score(
+                _score_band(pitcher.get("whip"), 1.45, 0.95, higher_is_better=False),
+                _context_score_from_environment("strikeouts", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")),
+                confirmed_boost,
+            ),
+        },
+        "earned_runs_under": {
+            "pitcher_skill": _avg_score(
+                _score_band(pitcher.get("xera"), 5.5, 2.8, higher_is_better=False),
+                _score_band(pitcher.get("siera"), 5.3, 2.9, higher_is_better=False),
+                _score_band(pitcher.get("era"), 5.5, 2.7, higher_is_better=False),
+                _score_band(pitcher.get("hard_hit_pct"), 47.0, 30.0, higher_is_better=False),
+                _score_band(pitcher.get("ev"), 91.5, 85.0, higher_is_better=False),
+            ),
+            "pitch_quality": _avg_score(
+                _score_band(primary_pitch.get("spin_rate"), 1900.0, 2900.0),
+                _score_band(primary_pitch.get("velocity"), 88.0, 99.0),
+            ),
+            "opponent_profile": _avg_score(
+                _score_band(opponent_runs_pg, 5.6, 3.5, higher_is_better=False),
+                _score_band(opponent_ops, 0.820, 0.650, higher_is_better=False),
+                _score_band(lineup.get("avg_obp"), 0.355, 0.295, higher_is_better=False),
+                confirmed_boost,
+            ),
+            "pitch_matchup": _avg_score(
+                _score_band(lineup.get("avg_vs_primary_pitch"), 0.310, 0.210, higher_is_better=False),
+                _score_band(lineup.get("avg_k_vs_primary_pitch"), 16.0, 33.0),
+            ),
+            "context": _avg_score(
+                _context_score_from_environment("runs", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")),
+                _score_band(umpire_runs, 10.2, 8.0, higher_is_better=False),
+                confirmed_boost,
+            ),
+        },
+        "hits_allowed_under": {
+            "pitcher_skill": _avg_score(
+                _score_band(pitcher.get("whip"), 1.45, 0.95, higher_is_better=False),
+                _score_band(pitcher.get("hard_hit_pct"), 47.0, 30.0, higher_is_better=False),
+                _score_band(pitcher.get("ev"), 91.5, 85.0, higher_is_better=False),
+                _score_band(pitcher.get("xera"), 5.4, 2.8, higher_is_better=False),
+            ),
+            "pitch_quality": _avg_score(
+                _score_band(primary_pitch.get("spin_rate"), 1900.0, 2900.0),
+                _score_band(primary_pitch.get("extension"), 5.5, 7.2),
+                _score_band(primary_pitch.get("velocity"), 88.0, 99.0),
+            ),
+            "opponent_profile": _avg_score(
+                _score_band(opponent_ops, 0.820, 0.650, higher_is_better=False),
+                _score_band(opponent_runs_pg, 5.6, 3.5, higher_is_better=False),
+                _score_band(lineup.get("avg_obp"), 0.355, 0.295, higher_is_better=False),
+                confirmed_boost,
+            ),
+            "pitch_matchup": _avg_score(
+                _score_band(lineup.get("avg_vs_primary_pitch"), 0.315, 0.210, higher_is_better=False),
+                _score_band(lineup.get("avg_k_vs_primary_pitch"), 16.0, 33.0),
+            ),
+            "context": _avg_score(
+                _context_score_from_environment("hits", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")),
+                _score_band(umpire_runs, 10.2, 8.0, higher_is_better=False),
+                confirmed_boost,
+            ),
+        },
+        "outs_recorded_over": {
+            "pitcher_skill": _avg_score(
+                _score_band(pitcher.get("whip"), 1.45, 0.95, higher_is_better=False),
+                _score_band(pitcher.get("bb_pct"), 11.0, 3.5, higher_is_better=False),
+                _score_band(pitcher.get("xera"), 5.5, 2.8, higher_is_better=False),
+                _score_band(pitcher.get("csw_pct"), 26.0, 35.0),
+            ),
+            "pitch_quality": _avg_score(
+                _score_band(primary_pitch.get("velocity"), 88.0, 99.0),
+                _score_band(primary_pitch.get("extension"), 5.5, 7.2),
+                _score_band(primary_pitch.get("usage_pct"), 18.0, 45.0),
+            ),
+            "opponent_profile": _avg_score(
+                _score_band(opponent_runs_pg, 5.6, 3.5, higher_is_better=False),
+                _score_band(opponent_ops, 0.820, 0.650, higher_is_better=False),
+                _score_band(opponent_bb_pg, 4.5, 2.5, higher_is_better=False),
+                confirmed_boost,
+            ),
+            "pitch_matchup": _avg_score(
+                _score_band(lineup.get("avg_vs_primary_pitch"), 0.315, 0.210, higher_is_better=False),
+                _score_band(lineup.get("avg_k_vs_primary_pitch"), 16.0, 33.0),
+            ),
+            "context": _avg_score(
+                _context_score_from_environment("runs", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")),
+                _score_band(umpire_runs, 10.2, 8.0, higher_is_better=False),
+                confirmed_boost,
+            ),
+        },
+    }
+
+    candidates: List[Dict[str, Any]] = []
+    for bet_type, components in component_scores.items():
+        weights = MLB_PITCH_PROP_WEIGHTS.get(bet_type, {})
+        score = 0.0
+        for component_name, component_score in components.items():
+            score += float(weights.get(component_name, 0.0)) * float(component_score)
+        candidates.append(
+            {
+                "bet_type": bet_type,
+                "lean": "under" if bet_type.endswith("_under") else "over",
+                "score": round(score * 100.0, 1),
+                "components": {k: round(v * 100.0, 1) for k, v in components.items()},
+            }
+        )
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates
+
+
+def _pitch_prop_confidence_label(score: float) -> str:
+    if score >= 74:
+        return "A"
+    if score >= 66:
+        return "B"
+    if score >= 58:
+        return "C"
+    return "D"
+
+
+def _pitch_prop_reasons(snapshot: Dict[str, Any], candidate: Dict[str, Any]) -> List[str]:
+    pitcher = snapshot.get("pitcher") or {}
+    lineup = snapshot.get("lineup") or {}
+    opponent = snapshot.get("opponent_team") or {}
+    primary_pitch = pitcher.get("primary_pitch") or {}
+    reasons = []
+    skill_bits = []
+    if pitcher.get("k_pct") is not None:
+        skill_bits.append(f"K% {pitcher.get('k_pct'):.1f}")
+    if pitcher.get("bb_pct") is not None:
+        skill_bits.append(f"BB% {pitcher.get('bb_pct'):.1f}")
+    if pitcher.get("csw_pct") is not None:
+        skill_bits.append(f"CSW% {pitcher.get('csw_pct'):.1f}")
+    if pitcher.get("swstr_pct") is not None:
+        skill_bits.append(f"SwStr% {pitcher.get('swstr_pct'):.1f}")
+    if skill_bits:
+        reasons.append("Pitcher skill: " + " | ".join(skill_bits) + ".")
+    pitch_bits = []
+    if primary_pitch.get("description") or primary_pitch.get("code"):
+        pitch_bits.append(str(primary_pitch.get("description") or primary_pitch.get("code")))
+    if primary_pitch.get("usage_pct") is not None:
+        pitch_bits.append(f"{float(primary_pitch.get('usage_pct')):.1f}% usage")
+    if primary_pitch.get("velocity") is not None:
+        pitch_bits.append(f"{float(primary_pitch.get('velocity')):.1f} mph")
+    if primary_pitch.get("spin_rate") is not None:
+        pitch_bits.append(f"{float(primary_pitch.get('spin_rate')):.0f} rpm")
+    if pitch_bits:
+        reasons.append("Primary pitch: " + " | ".join(pitch_bits) + ".")
+    matchup_bits = []
+    if lineup.get("avg_hitter_k_pct") is not None:
+        matchup_bits.append(f"lineup K% {lineup.get('avg_hitter_k_pct'):.1f}")
+    if lineup.get("avg_vs_primary_pitch") is not None:
+        matchup_bits.append(f"AVG vs primary pitch {lineup.get('avg_vs_primary_pitch'):.3f}")
+    if lineup.get("avg_k_vs_primary_pitch") is not None:
+        matchup_bits.append(f"K% vs primary pitch {lineup.get('avg_k_vs_primary_pitch'):.1f}")
+    if matchup_bits:
+        reasons.append("Projected lineup: " + " | ".join(matchup_bits) + ".")
+    opponent_bits = []
+    if opponent.get("runs_per_game") is not None:
+        opponent_bits.append(f"R/G {opponent.get('runs_per_game'):.2f}")
+    if opponent.get("ops") is not None:
+        opponent_bits.append(f"OPS {opponent.get('ops'):.3f}")
+    if opponent.get("strikeouts_per_game") is not None:
+        opponent_bits.append(f"K/G {opponent.get('strikeouts_per_game'):.2f}")
+    if opponent_bits:
+        reasons.append(f"Opponent {snapshot.get('opponent')} team profile: " + " | ".join(opponent_bits) + ".")
+    reasons.append(f"{candidate.get('bet_type').replace('_', ' ')} score {candidate.get('score'):.1f} with {lineup.get('status') or 'team-stat fallback'} data.")
+    return reasons[:4]
+
+
+def _empty_pitcher_lineup_summary() -> Dict[str, Any]:
+    return {
+        "status": "",
+        "confirmed": False,
+        "player_count": 0,
+        "avg_hitter_k_pct": None,
+        "avg_hitter_bb_pct": None,
+        "avg_obp": None,
+        "avg_vs_primary_pitch": None,
+        "avg_k_vs_primary_pitch": None,
+        "handedness": {"L": 0, "R": 0, "S": 0},
+        "players": [],
+    }
+
+
+def _build_mlb_pitcher_daily_snapshot(game: Dict[str, Any], side: str, season_year: int, rotowire_index: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    opponent_side = "home" if side == "away" else "away"
+    team_block = game.get(side) or {}
+    opponent_block = game.get(opponent_side) or {}
+    probable = team_block.get("probable_pitcher") or {}
+    pitcher_name = str(probable.get("fullName") or probable.get("name") or "").strip()
+    pitcher_id = probable.get("id")
+    if not pitcher_name or not pitcher_id:
+        return None
+    opponent_abbr = str(opponent_block.get("abbr") or "").upper()
+    pitcher_profile = _mlb_player_profile(pitcher_name)
+    statsapi_stats, _, _ = _mlb_player_stats_with_fallback(int(pitcher_id), "pitching", season_year)
+    fangraphs = _fangraphs_pitcher_snapshot(pitcher_name, str(team_block.get("abbr") or "").upper(), season_year)
+    primary_pitch = _mlb_primary_pitch(int(pitcher_id), season_year)
+    savant_pitch = _baseballsavant_primary_pitch_snapshot(pitcher_name, str(primary_pitch.get("code") or ""), season_year) if primary_pitch.get("code") else {}
+    pitcher_metrics = _metric_bundle_for_pitcher(
+        pitcher_name=pitcher_name,
+        pitcher_team=str(team_block.get("abbr") or "").upper(),
+        pitcher_profile=pitcher_profile,
+        statsapi_stats=statsapi_stats,
+        fangraphs=fangraphs,
+        primary_pitch=primary_pitch,
+        savant_pitch=savant_pitch,
+    )
+    opponent_team_stats, opponent_stats_year, opponent_stats_fallback = _mlb_team_stats_with_fallback(int(opponent_block.get("id") or 0), "hitting", season_year) if opponent_block.get("id") else ({}, season_year, False)
+    lineup_info = rotowire_index.get(opponent_abbr, {})
+    lineup_summary = _lineup_summary_for_pitcher(lineup_info, primary_pitch, season_year) if lineup_info else _empty_pitcher_lineup_summary()
+    game_env = _mlb_game_environment(game.get("game_pk"))
+    if lineup_info:
+        weather = (lineup_info.get("game") or {}).get("weather") or {}
+        if weather.get("temp_f") is not None:
+            game_env["temperature_f"] = weather.get("temp_f")
+        if weather.get("wind_mph") is not None:
+            game_env["wind_mph"] = weather.get("wind_mph")
+        if weather.get("wind_direction"):
+            game_env["wind_direction"] = str(weather.get("wind_direction")).lower().replace("-", "_")
+    opponent_summary = {
+        "team": opponent_abbr,
+        "runs_per_game": _mlb_stat_float(opponent_team_stats, ("runsPerGame",)),
+        "ops": _mlb_stat_float(opponent_team_stats, ("ops", "onBasePlusSlugging")),
+        "strikeouts_per_game": _team_stat_per_game(opponent_team_stats, ("strikeOuts", "strikeouts")),
+        "walks_per_game": _team_stat_per_game(opponent_team_stats, ("baseOnBalls", "walks")),
+        "stats_year": opponent_stats_year,
+        "stats_fallback": opponent_stats_fallback,
+    }
+    return {
+        "pitcher_id": pitcher_id,
+        "team": str(team_block.get("abbr") or "").upper(),
+        "opponent": opponent_abbr,
+        "game": game,
+        "pitcher": pitcher_metrics,
+        "lineup": lineup_summary,
+        "opponent_team": opponent_summary,
+        "context": {
+            "game_pk": game.get("game_pk"),
+            "game_date": game.get("game_date"),
+            "venue": game.get("venue") or game_env.get("venue"),
+            "umpire": ((lineup_info.get("game") or {}).get("umpire") if lineup_info else {}) or {},
+            "environment": game_env,
+        },
+        "sources": {
+            "fangraphs": pitcher_metrics.get("source_flags", {}).get("fangraphs", False),
+            "baseballsavant": pitcher_metrics.get("source_flags", {}).get("baseballsavant", False),
+            "rotowire": bool(lineup_info),
+            "statsapi": True,
+        },
+    }
+
+
+def _side_model_score(score_map: Dict[str, Any], market_key: str, side: str) -> float:
+    market_meta = MLB_PITCH_ODDS_MARKETS.get(market_key) or {}
+    preferred = str(market_meta.get("preferred_bet_type") or "")
+    preferred_score = _safe_float(score_map.get(preferred), 50.0)
+    preferred_side = "under" if preferred.endswith("_under") else "over"
+    if str(side).lower() == preferred_side:
+        return round(_clamp(preferred_score, 1.0, 99.0), 2)
+    return round(_clamp(100.0 - preferred_score, 1.0, 99.0), 2)
+
+
+def _project_pitcher_market_means(snapshot: Dict[str, Any], prop_candidates: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
+    pitcher = snapshot.get("pitcher") or {}
+    lineup = snapshot.get("lineup") or {}
+    opponent = snapshot.get("opponent_team") or {}
+    context = snapshot.get("context") or {}
+    primary_pitch = pitcher.get("primary_pitch") or {}
+    env = context.get("environment") or {}
+    umpire = context.get("umpire") or {}
+    confirmed_factor = 1.0 if lineup.get("confirmed") else 0.62
+
+    ip_per_start = _safe_float(pitcher.get("ip_per_start"), 5.5)
+    base_outs = _clamp(ip_per_start * 3.0, 12.0, 21.0)
+    outs_score = _avg_score(
+        _score_band(pitcher.get("ip_per_start"), 4.8, 6.4),
+        _score_band(pitcher.get("whip"), 1.45, 0.95, higher_is_better=False),
+        _score_band(pitcher.get("xera"), 5.4, 2.8, higher_is_better=False),
+        _score_band(opponent.get("ops"), 0.820, 0.650, higher_is_better=False),
+        _score_band(opponent.get("runs_per_game"), 5.6, 3.5, higher_is_better=False),
+        confirmed_factor,
+        _context_score_from_environment("runs", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")),
+    )
+    projected_outs = _clamp(base_outs + (6.0 * (outs_score - 0.5)), 10.5, 21.5)
+    projected_ip = projected_outs / 3.0
+
+    k_per_9 = _safe_float(pitcher.get("k_per_9"), None)
+    if k_per_9 is None and pitcher.get("k_pct") is not None:
+        k_per_9 = float(pitcher.get("k_pct")) * 0.38
+    bb_per_9 = _safe_float(pitcher.get("bb_per_9"), None)
+    if bb_per_9 is None and pitcher.get("bb_pct") is not None:
+        bb_per_9 = float(pitcher.get("bb_pct")) * 0.38
+    hits_per_9 = _safe_float(pitcher.get("hits_per_9"), None)
+    if hits_per_9 is None and pitcher.get("whip") is not None:
+        whip = float(pitcher.get("whip"))
+        hits_per_9 = max(5.5, (whip * 9.0) - float(bb_per_9 or 0.0))
+
+    strikeouts_base = max(1.0, projected_ip * float(k_per_9 or 8.2) / 9.0)
+    strikeouts_factor = 1.0
+    strikeouts_factor += 0.42 * (_score_band(lineup.get("avg_hitter_k_pct"), 18.0, 28.0) - 0.5)
+    strikeouts_factor += 0.28 * (_score_band(lineup.get("avg_k_vs_primary_pitch"), 18.0, 35.0) - 0.5)
+    strikeouts_factor += 0.24 * (_score_band(pitcher.get("swstr_pct"), 8.0, 18.0) - 0.5)
+    strikeouts_factor += 0.16 * (_score_band(umpire.get("strikeouts_per_game"), 15.5, 19.0) - 0.5)
+    strikeouts_factor += 0.10 * (_score_band(primary_pitch.get("velocity"), 88.0, 99.0) - 0.5)
+    strikeouts_factor += 0.10 * (_context_score_from_environment("strikeouts", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")) - 0.5)
+    projected_strikeouts = _clamp(strikeouts_base * max(0.55, strikeouts_factor), 0.8, 12.5)
+
+    walks_base = max(0.2, projected_ip * float(bb_per_9 or 2.8) / 9.0)
+    walks_factor = 1.0
+    walks_factor += 0.34 * (_score_band(lineup.get("avg_hitter_bb_pct"), 5.5, 10.5) - 0.5)
+    walks_factor += 0.22 * (_score_band(opponent.get("walks_per_game"), 2.4, 4.5) - 0.5)
+    walks_factor += 0.28 * (_score_band(pitcher.get("bb_pct"), 3.0, 11.0) - 0.5)
+    walks_factor += 0.10 * ((_score_band(primary_pitch.get("extension"), 5.5, 7.1) - 0.5) * -1.0)
+    projected_walks = _clamp(walks_base * max(0.55, walks_factor), 0.2, 5.5)
+
+    earned_runs_base = max(0.3, projected_ip * float(pitcher.get("xera") or pitcher.get("era") or 4.1) / 9.0)
+    earned_runs_factor = 1.0
+    earned_runs_factor += 0.34 * (_score_band(opponent.get("ops"), 0.650, 0.820) - 0.5)
+    earned_runs_factor += 0.24 * (_score_band(lineup.get("avg_obp"), 0.295, 0.355) - 0.5)
+    earned_runs_factor += 0.22 * (_score_band(lineup.get("avg_vs_primary_pitch"), 0.210, 0.315) - 0.5)
+    earned_runs_factor += 0.18 * ((_context_score_from_environment("runs", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")) * -1.0) + 0.5)
+    earned_runs_factor += 0.14 * (_score_band(pitcher.get("hard_hit_pct"), 30.0, 47.0) - 0.5)
+    earned_runs_factor -= 0.12 * (_score_band(pitcher.get("k_pct"), 14.0, 32.0) - 0.5)
+    projected_earned_runs = _clamp(earned_runs_base * max(0.55, earned_runs_factor), 0.2, 6.5)
+
+    hits_base = max(2.0, projected_ip * float(hits_per_9 or 7.6) / 9.0)
+    if pitcher.get("whip") is not None:
+        hits_base = max(hits_base, (float(pitcher.get("whip")) * projected_ip) - projected_walks)
+    hits_factor = 1.0
+    hits_factor += 0.30 * (_score_band(opponent.get("ops"), 0.650, 0.820) - 0.5)
+    hits_factor += 0.24 * (_score_band(lineup.get("avg_obp"), 0.295, 0.355) - 0.5)
+    hits_factor += 0.22 * (_score_band(lineup.get("avg_vs_primary_pitch"), 0.210, 0.315) - 0.5)
+    hits_factor += 0.18 * ((_context_score_from_environment("hits", env.get("altitude_ft"), env.get("wind_mph"), env.get("wind_direction", ""), env.get("temperature_f")) * -1.0) + 0.5)
+    hits_factor += 0.16 * (_score_band(pitcher.get("hard_hit_pct"), 30.0, 47.0) - 0.5)
+    projected_hits = _clamp(hits_base * max(0.55, hits_factor), 1.5, 12.5)
+
+    if prop_candidates is None:
+        prop_candidates = _score_pitcher_prop_candidates(snapshot)
+    score_map = {item["bet_type"]: item["score"] for item in prop_candidates}
+
+    return {
+        "pitcher_strikeouts": {
+            "expected_stat": round(projected_strikeouts, 2),
+            "std_dev": MLB_PITCH_ODDS_MARKETS["pitcher_strikeouts"]["std_dev"],
+            "model_score": _side_model_score(score_map, "pitcher_strikeouts", "over"),
+        },
+        "pitcher_walks": {
+            "expected_stat": round(projected_walks, 2),
+            "std_dev": MLB_PITCH_ODDS_MARKETS["pitcher_walks"]["std_dev"],
+            "model_score": _side_model_score(score_map, "pitcher_walks", "under"),
+        },
+        "pitcher_earned_runs": {
+            "expected_stat": round(projected_earned_runs, 2),
+            "std_dev": MLB_PITCH_ODDS_MARKETS["pitcher_earned_runs"]["std_dev"],
+            "model_score": _side_model_score(score_map, "pitcher_earned_runs", "under"),
+        },
+        "pitcher_hits_allowed": {
+            "expected_stat": round(projected_hits, 2),
+            "std_dev": MLB_PITCH_ODDS_MARKETS["pitcher_hits_allowed"]["std_dev"],
+            "model_score": _side_model_score(score_map, "pitcher_hits_allowed", "under"),
+        },
+        "pitcher_outs": {
+            "expected_stat": round(projected_outs, 2),
+            "std_dev": MLB_PITCH_ODDS_MARKETS["pitcher_outs"]["std_dev"],
+            "model_score": _side_model_score(score_map, "pitcher_outs", "over"),
+        },
+    }
+
+
+def _pitch_market_probabilities(expected_stat: float, line: float, std_dev: float) -> Tuple[float, float]:
+    over_prob = (1.0 - _normal_cdf(float(line), float(expected_stat), float(std_dev))) * 100.0
+    over_prob = _clamp(over_prob, 1.0, 99.0)
+    under_prob = _clamp(100.0 - over_prob, 1.0, 99.0)
+    return round(over_prob, 2), round(under_prob, 2)
+
+
+def _odds_events_for_sport(sport_key: str) -> List[Dict[str, Any]]:
+    cache_key = ("odds_events", sport_key)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or []
+    url = f"{ODDS_API_BASE_URL}/sports/{sport_key}/events"
+    data = _fetch_json(url, params={"apiKey": ODDS_API_KEY, "dateFormat": "iso"})
+    rows = data if isinstance(data, list) else []
+    _set_cached_external(cache_key, rows)
+    return rows
+
+
+def _odds_event_index(sport_key: str) -> Dict[Tuple[str, str, str, str], List[Dict[str, Any]]]:
+    index: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
+    for event in _odds_events_for_sport(sport_key):
+        home_full = _team_name_key(event.get("home_team"))
+        away_full = _team_name_key(event.get("away_team"))
+        home_short = _team_short_name_key(event.get("home_team"))
+        away_short = _team_short_name_key(event.get("away_team"))
+        key = (home_full, away_full, home_short, away_short)
+        index.setdefault(key, []).append(event)
+    return index
+
+
+def _parse_iso_datetime(text: str) -> Optional[datetime.datetime]:
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _match_odds_event_for_game(game: Dict[str, Any], sport_key: str) -> Optional[Dict[str, Any]]:
+    index = _odds_event_index(sport_key)
+    home = game.get("home") or {}
+    away = game.get("away") or {}
+    home_full = _team_name_key(home.get("name"))
+    away_full = _team_name_key(away.get("name"))
+    home_short = _team_short_name_key(home.get("name"))
+    away_short = _team_short_name_key(away.get("name"))
+    candidates: List[Dict[str, Any]] = []
+    for key, items in index.items():
+        if key[0] == home_full and key[1] == away_full:
+            candidates.extend(items)
+        elif key[2] == home_short and key[3] == away_short:
+            candidates.extend(items)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    game_dt = _parse_iso_datetime(game.get("game_date"))
+    if not game_dt:
+        return sorted(candidates, key=lambda item: str(item.get("commence_time") or ""))[0]
+    candidates = sorted(
+        candidates,
+        key=lambda item: abs(((_parse_iso_datetime(item.get("commence_time")) or game_dt) - game_dt).total_seconds()),
+    )
+    return candidates[0]
+
+
+def _odds_event_market_payload(sport_key: str, event_id: str, bookmaker: str, regions: str, markets: str) -> Dict[str, Any]:
+    cache_key = ("odds_event_market_payload", sport_key, event_id, bookmaker, regions, markets)
+    cached = _cached_external(cache_key)
+    if cached is not None:
+        return cached or {}
+    url = f"{ODDS_API_BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
+    payload = _fetch_json(
+        url,
+        params={
+            "apiKey": ODDS_API_KEY,
+            "regions": regions,
+            "markets": markets,
+            "oddsFormat": "american",
+            "bookmakers": bookmaker,
+            "dateFormat": "iso",
+        },
+    )
+    _set_cached_external(cache_key, payload)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _parse_pitcher_market_rows(event_payload: Dict[str, Any], pitcher_name: str = "") -> List[Dict[str, Any]]:
+    books = event_payload.get("bookmakers") or []
+    rows: List[Dict[str, Any]] = []
+    for book in books:
+        for market in book.get("markets", []) or []:
+            market_key = str(market.get("key") or "")
+            if market_key not in MLB_PITCH_ODDS_MARKETS:
+                continue
+            grouped: Dict[Tuple[str, float], Dict[str, Any]] = {}
+            for outcome in market.get("outcomes", []) or []:
+                desc = str(outcome.get("description") or "").strip()
+                if not desc:
+                    continue
+                if pitcher_name and not _player_name_matches(desc, pitcher_name):
+                    continue
+                line = _safe_float(outcome.get("point"), None)
+                if line is None:
+                    continue
+                row = grouped.setdefault(
+                    (desc, float(line)),
+                    {
+                        "player_name": desc,
+                        "market_key": market_key,
+                        "line": float(line),
+                        "bookmaker": book.get("key"),
+                        "bookmaker_title": book.get("title"),
+                        "last_update": market.get("last_update"),
+                        "over_odds": None,
+                        "under_odds": None,
+                    },
+                )
+                side = str(outcome.get("name") or "").strip().lower()
+                try:
+                    price = int(outcome.get("price"))
+                except Exception:
+                    price = None
+                if side == "over":
+                    row["over_odds"] = price
+                elif side == "under":
+                    row["under_odds"] = price
+            rows.extend(grouped.values())
+    rows.sort(key=lambda item: (item.get("market_key", ""), item.get("line", 0.0)))
+    return rows
+
+
+def build_mlb_pitcher_market_edges(
+    game_date: datetime.date,
+    season_year: int,
+    bookmaker: str = "draftkings",
+    regions: str = "us",
+    markets: str = MLB_DEFAULT_PITCH_MARKETS,
+    min_edge_pct: float = 2.0,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    if not ODDS_API_KEY:
+        raise HTTPException(status_code=400, detail="ODDS_API_KEY not configured")
+    sport_key = _odds_sport_key("mlb")
+    market_keys = [m.strip() for m in str(markets or MLB_DEFAULT_PITCH_MARKETS).split(",") if m.strip() in MLB_PITCH_ODDS_MARKETS]
+    if not market_keys:
+        raise HTTPException(status_code=400, detail="No supported MLB pitcher markets requested")
+
+    rotowire_index = _rotowire_lineup_index(game_date)
+    schedule_games = _mlb_schedule_games_for_date(game_date)
+    recommendations: List[Dict[str, Any]] = []
+    pitchers_scanned = 0
+    market_rows_scanned = 0
+
+    for game in schedule_games:
+        event = _match_odds_event_for_game(game, sport_key)
+        if not event:
+            continue
+        event_payload = _odds_event_market_payload(sport_key, str(event.get("id") or ""), bookmaker, regions, ",".join(market_keys))
+        for side in ("away", "home"):
+            snapshot = _build_mlb_pitcher_daily_snapshot(game, side, season_year, rotowire_index)
+            if not snapshot:
+                continue
+            pitchers_scanned += 1
+            prop_candidates = _score_pitcher_prop_candidates(snapshot)
+            score_map = {item["bet_type"]: item["score"] for item in prop_candidates}
+            candidate_map = {item["bet_type"]: item for item in prop_candidates}
+            projections = _project_pitcher_market_means(snapshot, prop_candidates=prop_candidates)
+            market_rows = _parse_pitcher_market_rows(event_payload, pitcher_name=(snapshot.get("pitcher") or {}).get("name", ""))
+            for row in market_rows:
+                market_rows_scanned += 1
+                market_key = str(row.get("market_key") or "")
+                projection = projections.get(market_key) or {}
+                if not projection:
+                    continue
+                line = _safe_float(row.get("line"), None)
+                expected_stat = _safe_float(projection.get("expected_stat"), None)
+                std_dev = _safe_float(projection.get("std_dev"), None)
+                if line is None or expected_stat is None or std_dev is None:
+                    continue
+                over_prob, under_prob = _pitch_market_probabilities(expected_stat, line, std_dev)
+                over_implied = implied_probability_from_american(row.get("over_odds"))
+                under_implied = implied_probability_from_american(row.get("under_odds"))
+                over_edge = round(over_prob - float(over_implied or 0.0), 2) if over_implied is not None else None
+                under_edge = round(under_prob - float(under_implied or 0.0), 2) if under_implied is not None else None
+                selected_side = ""
+                selected_odds = None
+                projected_probability = None
+                implied_probability = None
+                edge_pct = None
+                if over_edge is not None and (under_edge is None or over_edge >= under_edge):
+                    selected_side = "over"
+                    selected_odds = row.get("over_odds")
+                    projected_probability = over_prob
+                    implied_probability = over_implied
+                    edge_pct = over_edge
+                elif under_edge is not None:
+                    selected_side = "under"
+                    selected_odds = row.get("under_odds")
+                    projected_probability = under_prob
+                    implied_probability = under_implied
+                    edge_pct = under_edge
+                if not selected_side or edge_pct is None or edge_pct < float(min_edge_pct):
+                    continue
+                model_score = _side_model_score(score_map, market_key, selected_side)
+                preferred_bet_type = str((MLB_PITCH_ODDS_MARKETS.get(market_key) or {}).get("preferred_bet_type") or "")
+                confidence = calibrate_confidence(model_score, projected_probability)
+                recommendations.append(
+                    {
+                        "pitcher": (snapshot.get("pitcher") or {}).get("name"),
+                        "pitcher_id": snapshot.get("pitcher_id"),
+                        "team": snapshot.get("team"),
+                        "opponent": snapshot.get("opponent"),
+                        "event_id": event.get("id"),
+                        "commence_time": event.get("commence_time"),
+                        "market_key": market_key,
+                        "market_name": MLB_PITCH_ODDS_MARKETS[market_key]["display_name"],
+                        "line": line,
+                        "recommended_side": selected_side,
+                        "offered_odds": selected_odds,
+                        "projected_probability": projected_probability,
+                        "implied_probability": implied_probability,
+                        "edge_pct": edge_pct,
+                        "expected_stat": expected_stat,
+                        "line_delta": round(expected_stat - float(line), 2),
+                        "model_score": round(model_score, 2),
+                        "components": (candidate_map.get(preferred_bet_type) or {}).get("components", {}),
+                        "confidence": confidence,
+                        "fair_odds_american": _american_from_probability(projected_probability),
+                        "ev_units": _ev_units_for_american(projected_probability, selected_odds),
+                        "over_odds": row.get("over_odds"),
+                        "under_odds": row.get("under_odds"),
+                        "over_probability": over_prob,
+                        "under_probability": under_prob,
+                        "bookmaker": row.get("bookmaker"),
+                        "bookmaker_title": row.get("bookmaker_title"),
+                        "market_last_update": row.get("last_update"),
+                        "primary_pitch": (snapshot.get("pitcher") or {}).get("primary_pitch"),
+                        "lineup_status": (snapshot.get("lineup") or {}).get("status") or "team-stat fallback",
+                        "lineup_summary": {
+                            "avg_hitter_k_pct": (snapshot.get("lineup") or {}).get("avg_hitter_k_pct"),
+                            "avg_hitter_bb_pct": (snapshot.get("lineup") or {}).get("avg_hitter_bb_pct"),
+                            "avg_obp": (snapshot.get("lineup") or {}).get("avg_obp"),
+                            "avg_vs_primary_pitch": (snapshot.get("lineup") or {}).get("avg_vs_primary_pitch"),
+                            "avg_k_vs_primary_pitch": (snapshot.get("lineup") or {}).get("avg_k_vs_primary_pitch"),
+                            "handedness": (snapshot.get("lineup") or {}).get("handedness"),
+                            "players": (snapshot.get("lineup") or {}).get("players", [])[:9],
+                        },
+                        "pitcher_metrics": {
+                            "k_pct": (snapshot.get("pitcher") or {}).get("k_pct"),
+                            "bb_pct": (snapshot.get("pitcher") or {}).get("bb_pct"),
+                            "k_bb_pct": (snapshot.get("pitcher") or {}).get("k_bb_pct"),
+                            "swstr_pct": (snapshot.get("pitcher") or {}).get("swstr_pct"),
+                            "csw_pct": (snapshot.get("pitcher") or {}).get("csw_pct"),
+                            "whip": (snapshot.get("pitcher") or {}).get("whip"),
+                            "xera": (snapshot.get("pitcher") or {}).get("xera"),
+                            "siera": (snapshot.get("pitcher") or {}).get("siera"),
+                            "ip_per_start": (snapshot.get("pitcher") or {}).get("ip_per_start"),
+                            "hits_per_9": (snapshot.get("pitcher") or {}).get("hits_per_9"),
+                        },
+                        "all_prop_scores": score_map,
+                        "reasons": _pitch_prop_reasons(snapshot, {"bet_type": f"{market_key}_{selected_side}", "score": model_score}),
+                        "sources": snapshot.get("sources"),
+                    }
+                )
+
+    recommendations.sort(key=lambda item: (float(item.get("edge_pct") or 0.0), float(item.get("confidence") or 0.0)), reverse=True)
+    return {
+        "sport": "mlb",
+        "date": game_date.isoformat(),
+        "season_year": season_year,
+        "bookmaker": bookmaker,
+        "regions": regions,
+        "markets": market_keys,
+        "model_version": MODEL_VERSION,
+        "pitchers_scanned": pitchers_scanned,
+        "market_rows_scanned": market_rows_scanned,
+        "count": len(recommendations[: max(1, int(limit))]),
+        "recommendations": recommendations[: max(1, int(limit))],
+        "source_timestamp": _now_iso(),
+        "data_sources": {
+            "odds_api": "event odds endpoint with official MLB pitcher player-prop markets",
+            "fangraphs": "legacy leaderboards types 1, 5, and 24",
+            "baseballsavant": "statcast_search grouped pitch traits by primary pitch",
+            "rotowire": "daily-lineups page for projected/confirmed lineups, weather, and umpire context",
+            "statsapi": "schedule, probable pitchers, pitch arsenal, team stats, and hitter pitch logs",
+        },
+    }
+
+
+def build_mlb_daily_pitching_bets(game_date: datetime.date, season_year: int, min_score: float = 55.0, limit: int = 10) -> Dict[str, Any]:
+    rotowire_index = _rotowire_lineup_index(game_date)
+    games = _mlb_schedule_games_for_date(game_date)
+    recommendations: List[Dict[str, Any]] = []
+    analyzed_pitchers = 0
+
+    for game in games:
+        for side in ("away", "home"):
+            snapshot = _build_mlb_pitcher_daily_snapshot(game, side, season_year, rotowire_index)
+            if not snapshot:
+                continue
+            analyzed_pitchers += 1
+            prop_candidates = _score_pitcher_prop_candidates(snapshot)
+            if not prop_candidates:
+                continue
+            best = prop_candidates[0]
+            if float(best.get("score") or 0.0) < float(min_score):
+                continue
+            pitcher_metrics = snapshot.get("pitcher") or {}
+            lineup_summary = snapshot.get("lineup") or {}
+            recommendations.append(
+                {
+                    "pitcher": pitcher_metrics.get("name"),
+                    "pitcher_id": snapshot.get("pitcher_id"),
+                    "team": snapshot.get("team"),
+                    "opponent": snapshot.get("opponent"),
+                    "bet_type": best.get("bet_type"),
+                    "lean": best.get("lean"),
+                    "score": best.get("score"),
+                    "confidence": _pitch_prop_confidence_label(float(best.get("score") or 0.0)),
+                    "components": best.get("components"),
+                    "all_prop_scores": {item["bet_type"]: item["score"] for item in prop_candidates},
+                    "lineup_status": lineup_summary.get("status") or "team-stat fallback",
+                    "primary_pitch": pitcher_metrics.get("primary_pitch"),
+                    "pitcher_metrics": {
+                        "k_pct": pitcher_metrics.get("k_pct"),
+                        "bb_pct": pitcher_metrics.get("bb_pct"),
+                        "k_bb_pct": pitcher_metrics.get("k_bb_pct"),
+                        "swstr_pct": pitcher_metrics.get("swstr_pct"),
+                        "csw_pct": pitcher_metrics.get("csw_pct"),
+                        "siera": pitcher_metrics.get("siera"),
+                        "xera": pitcher_metrics.get("xera"),
+                        "hard_hit_pct": pitcher_metrics.get("hard_hit_pct"),
+                        "whip": pitcher_metrics.get("whip"),
+                    },
+                    "lineup_summary": {
+                        "avg_hitter_k_pct": lineup_summary.get("avg_hitter_k_pct"),
+                        "avg_hitter_bb_pct": lineup_summary.get("avg_hitter_bb_pct"),
+                        "avg_vs_primary_pitch": lineup_summary.get("avg_vs_primary_pitch"),
+                        "avg_k_vs_primary_pitch": lineup_summary.get("avg_k_vs_primary_pitch"),
+                        "handedness": lineup_summary.get("handedness"),
+                    },
+                    "reasons": _pitch_prop_reasons(snapshot, best),
+                    "sources": snapshot.get("sources"),
+                }
+            )
+
+    recommendations.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return {
+        "sport": "mlb",
+        "date": game_date.isoformat(),
+        "season_year": season_year,
+        "model_version": MODEL_VERSION,
+        "weights": MLB_PITCH_PROP_WEIGHTS,
+        "analyzed_pitchers": analyzed_pitchers,
+        "recommendations": recommendations[: max(1, int(limit))],
+        "data_sources": {
+            "fangraphs": "legacy leaderboards types 1, 5, and 24",
+            "baseballsavant": "statcast_search grouped pitch traits by primary pitch",
+            "rotowire": "daily-lineups page for projected/confirmed lineups, weather, and umpire context",
+            "statsapi": "schedule, probable pitchers, pitch arsenal, team stats, and hitter pitch logs",
+        },
+        "source_timestamp": _now_iso(),
+    }
 
 
 def _mlb_lineup_factor(prop: str, spot: Optional[int]) -> float:
@@ -4833,6 +6343,51 @@ def nba_player_splits(
     result = get_player_splits_without(player, names, season_label, season_type)
     result["source_timestamp"] = _now_iso()
     return result
+
+
+@app.get("/mlb/pitching-bets")
+def mlb_pitching_bets(
+    date: str = Query("", description="Defaults to today in local runtime time."),
+    season_year: int = Query(MLB_SEASON_YEAR, ge=2008, le=2100),
+    min_score: float = Query(55.0, ge=0.0, le=100.0),
+    limit: int = Query(10, ge=1, le=50),
+):
+    if date:
+        try:
+            game_date = datetime.date.fromisoformat(date)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    else:
+        game_date = datetime.date.today()
+    return build_mlb_daily_pitching_bets(game_date=game_date, season_year=season_year, min_score=min_score, limit=limit)
+
+
+@app.get("/mlb/pitching-bets/edges")
+def mlb_pitching_bet_edges(
+    date: str = Query("", description="Defaults to today in local runtime time."),
+    season_year: int = Query(MLB_SEASON_YEAR, ge=2008, le=2100),
+    bookmaker: str = Query("draftkings"),
+    regions: str = Query("us"),
+    markets: str = Query(MLB_DEFAULT_PITCH_MARKETS),
+    min_edge_pct: float = Query(2.0, ge=-50.0, le=100.0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    if date:
+        try:
+            game_date = datetime.date.fromisoformat(date)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    else:
+        game_date = datetime.date.today()
+    return build_mlb_pitcher_market_edges(
+        game_date=game_date,
+        season_year=season_year,
+        bookmaker=bookmaker.strip().lower(),
+        regions=regions.strip().lower() or "us",
+        markets=markets,
+        min_edge_pct=min_edge_pct,
+        limit=limit,
+    )
 
 
 @app.get("/health")

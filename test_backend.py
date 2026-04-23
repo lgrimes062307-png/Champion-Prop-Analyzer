@@ -358,3 +358,15 @@ def test_project_pitcher_market_means_returns_main_props():
     assert projections["pitcher_strikeouts"]["expected_stat"] > projections["pitcher_walks"]["expected_stat"]
     over_prob, under_prob = app._pitch_market_probabilities(projections["pitcher_strikeouts"]["expected_stat"], 7.5, projections["pitcher_strikeouts"]["std_dev"])
     assert over_prob > under_prob
+
+
+def test_pitcher_market_edges_returns_disabled_payload_without_odds_key(monkeypatch):
+    monkeypatch.setattr(app, "ODDS_API_KEY", "")
+    payload = app.build_mlb_pitcher_market_edges(
+        game_date=app.datetime.date(2026, 4, 22),
+        season_year=2026,
+        markets="pitcher_strikeouts,pitcher_walks",
+    )
+    assert payload["odds_enabled"] is False
+    assert payload["recommendations"] == []
+    assert payload["markets"] == ["pitcher_strikeouts", "pitcher_walks"]

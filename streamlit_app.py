@@ -1549,23 +1549,14 @@ with tab_analyze:
 
 with tab_pitch:
     st.subheader("MLB Pitch Lab")
-    st.caption("Ranks daily pitcher props from model-only signals and live market edges.")
+    st.caption("Ranks daily pitcher props from pitcher skill, pitch quality, lineup matchup, opponent profile, and game context.")
 
-    st.session_state.setdefault("pitch_lab_edge_payload", None)
-    st.session_state.setdefault("pitch_lab_edge_error", "")
     st.session_state.setdefault("pitch_lab_model_payload", None)
     st.session_state.setdefault("pitch_lab_model_error", "")
 
     today_local = datetime.datetime.now().date()
-    market_options = [
-        "pitcher_strikeouts",
-        "pitcher_walks",
-        "pitcher_earned_runs",
-        "pitcher_hits_allowed",
-        "pitcher_outs",
-    ]
 
-    ctl_a, ctl_b, ctl_c, ctl_d = st.columns([1.1, 1, 1, 1])
+    ctl_a, ctl_b, ctl_c, ctl_d = st.columns([1.1, 1, 1, 1.2])
     with ctl_a:
         pitch_lab_date = st.date_input("Slate Date", value=today_local, key="pitch_lab_date")
     with ctl_b:
@@ -1580,197 +1571,199 @@ with tab_pitch:
             )
         )
     with ctl_c:
-        pitch_lab_bookmaker = st.text_input("Bookmaker", value="draftkings", key="pitch_lab_bookmaker")
+        pitch_lab_limit = int(st.slider("Results", min_value=5, max_value=30, value=15, step=1, key="pitch_lab_limit"))
     with ctl_d:
-        pitch_lab_regions = st.text_input("Regions", value="us", key="pitch_lab_regions")
-
-    filter_a, filter_b, filter_c = st.columns([1.2, 1, 1])
-    with filter_a:
-        pitch_lab_markets = st.multiselect(
-            "Markets",
-            market_options,
-            default=market_options,
-            key="pitch_lab_markets",
-        )
-    with filter_b:
-        pitch_lab_limit = int(st.slider("Results", min_value=5, max_value=30, value=12, step=1, key="pitch_lab_limit"))
-    with filter_c:
-        pitch_lab_min_edge = float(
-            st.slider("Min Edge %", min_value=-2.0, max_value=12.0, value=2.0, step=0.5, key="pitch_lab_min_edge")
-        )
-
-    model_a, model_b = st.columns([1, 1.2])
-    with model_a:
         pitch_lab_min_score = float(
-            st.slider("Model Min Score", min_value=40.0, max_value=85.0, value=58.0, step=1.0, key="pitch_lab_min_score")
+            st.slider("Minimum Score", min_value=40.0, max_value=85.0, value=55.0, step=1.0, key="pitch_lab_min_score")
         )
-    with model_b:
-        load_pitch_lab = st.button("Load Pitch Lab", use_container_width=True, key="pitch_lab_load")
+
+    load_pitch_lab = st.button("Load Pitch Lab", use_container_width=True, key="pitch_lab_load")
 
     if load_pitch_lab:
         date_value = pitch_lab_date.isoformat() if hasattr(pitch_lab_date, "isoformat") else str(pitch_lab_date)
-        markets_csv = ",".join(pitch_lab_markets or market_options)
-        edge_payload, edge_error = _mlb_pitching_edges_data(
-            date_value=date_value,
-            season_year=pitch_lab_season_year,
-            bookmaker=pitch_lab_bookmaker.strip().lower() or "draftkings",
-            regions=pitch_lab_regions.strip().lower() or "us",
-            markets=markets_csv,
-            min_edge_pct=pitch_lab_min_edge,
-            limit=pitch_lab_limit,
-        )
         model_payload, model_error = _mlb_pitching_bets_data(
             date_value=date_value,
             season_year=pitch_lab_season_year,
             min_score=pitch_lab_min_score,
             limit=pitch_lab_limit,
         )
-        st.session_state["pitch_lab_edge_payload"] = edge_payload
-        st.session_state["pitch_lab_edge_error"] = edge_error
         st.session_state["pitch_lab_model_payload"] = model_payload
         st.session_state["pitch_lab_model_error"] = model_error
 
-    edge_payload = st.session_state.get("pitch_lab_edge_payload") or {}
-    edge_error = st.session_state.get("pitch_lab_edge_error") or ""
     model_payload = st.session_state.get("pitch_lab_model_payload") or {}
     model_error = st.session_state.get("pitch_lab_model_error") or ""
-    edge_rows = edge_payload.get("recommendations") or []
     model_rows = model_payload.get("recommendations") or []
-    odds_enabled = edge_payload.get("odds_enabled", True)
 
-    if edge_error:
-        st.warning(f"Market edges unavailable: {edge_error}")
-    elif odds_enabled is False:
-        st.info(edge_payload.get("message") or "Sportsbook market edges are disabled. Model Board rankings are still available.")
     if model_error:
-        st.warning(f"Model board unavailable: {model_error}")
-    if not edge_rows and not model_rows and not edge_error and not model_error:
-        st.info("Load a slate to see ranked pitcher props, market edges, and matchup visuals.")
+        st.warning(f"Pitch Lab unavailable: {model_error}")
+    if not model_rows and not model_error:
+        st.info("Load a slate to see ranked pitcher props, matchup visuals, and source checks.")
 
-    if edge_rows:
-        best_edge = edge_rows[0]
+    if model_rows:
+        best_model = model_rows[0]
+        best_pitch = best_model.get("primary_pitch") or {}
+        best_metrics = best_model.get("pitcher_metrics") or {}
+        best_lineup = best_model.get("lineup_summary") or {}
+        best_pick = f"{str(best_model.get('lean', '')).upper()} {str(best_model.get('market_name') or best_model.get('bet_type', '')).replace('_', ' ')}"
+
         hero_col, gauge_col = st.columns([2.2, 1])
         with hero_col:
-            _render_pitch_edge_hero(best_edge)
+            st.markdown(
+                f"""
+                <div class="hero-card">
+                  <div class="section-label">Top Model Pitch</div>
+                  <div class="hero-title">{html.escape(str(best_model.get("pitcher", "")))}</div>
+                  <div class="hero-sub">{html.escape(str(best_model.get("team", "")))} vs {html.escape(str(best_model.get("opponent", "")))} - {html.escape(str(best_model.get("lineup_status", "")))}</div>
+                  <div class="hero-rec" style="color:#0f766e;">{html.escape(best_pick)}</div>
+                  <div class="pill-row">
+                    <span class="pill">Score {html.escape(_safe_num(best_model.get("score"), 1))}</span>
+                    <span class="pill">Expected {html.escape(_safe_num(best_model.get("expected_stat"), 2))}</span>
+                    <span class="pill">K% {html.escape(_safe_num(best_metrics.get("k_pct"), 1))}</span>
+                    <span class="pill">CSW% {html.escape(_safe_num(best_metrics.get("csw_pct"), 1))}</span>
+                    <span class="pill">{html.escape(str(best_pitch.get("description") or best_pitch.get("code") or "Pitch mix"))}</span>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
         with gauge_col:
-            _render_gauge(best_edge.get("confidence", 0), "Market Confidence", color="#0f766e")
+            _render_gauge(best_model.get("score", 0), "Model Score", color="#0f766e")
 
-        edge_values = [float(row.get("edge_pct", 0) or 0) for row in edge_rows]
-        confidence_values = [float(row.get("confidence", 0) or 0) for row in edge_rows]
-        confirmed_count = sum(1 for row in edge_rows if "confirmed" in str(row.get("lineup_status", "")).lower())
-        avg_edge = sum(edge_values) / len(edge_values) if edge_values else 0.0
-        avg_conf = sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
-        confirmed_rate = (confirmed_count / len(edge_rows) * 100.0) if edge_rows else 0.0
+        score_values = [float(row.get("score", 0) or 0) for row in model_rows]
+        confirmed_count = sum(1 for row in model_rows if "confirmed" in str(row.get("lineup_status", "")).lower())
+        confirmed_rate = (confirmed_count / len(model_rows) * 100.0) if model_rows else 0.0
+        avg_score = sum(score_values) / len(score_values) if score_values else 0.0
+        strong_count = sum(1 for score in score_values if score >= 65.0)
         _render_metric_cards(
             [
-                ("Edges Found", str(len(edge_rows))),
-                ("Avg Edge", _safe_signed_pct(avg_edge)),
-                ("Avg Confidence", _safe_num(avg_conf, 1)),
+                ("Pitchers Ranked", str(len(model_rows))),
+                ("Strong Leans", str(strong_count)),
+                ("Avg Score", _safe_num(avg_score, 1)),
                 ("Confirmed Lineups", _safe_pct(confirmed_rate)),
             ]
         )
 
         chart_col_a, chart_col_b = st.columns([1.2, 1])
         with chart_col_a:
-            st.markdown("**Top Edges**")
-            _render_pitch_edge_bar_chart(edge_rows)
+            st.markdown("**Top Model Scores**")
+            model_chart_rows = [
+                {
+                    "pick": f"{row.get('pitcher', '')} {str(row.get('lean', '')).upper()} {str(row.get('market_name') or row.get('bet_type', '')).replace('_', ' ')}",
+                    "score": float(row.get("score", 0) or 0),
+                }
+                for row in model_rows[:12]
+            ]
+            _render_bars(model_chart_rows, "pick", "score", color="#2f80ed")
         with chart_col_b:
-            st.markdown("**Edge vs Confidence**")
-            _render_pitch_scatter_chart(edge_rows)
+            st.markdown("**Pitcher Skill Snapshot**")
+            skill_rows = []
+            for row in model_rows[:10]:
+                metrics = row.get("pitcher_metrics") or {}
+                skill_rows.append(
+                    {
+                        "pitcher": row.get("pitcher"),
+                        "k_pct": metrics.get("k_pct"),
+                        "bb_pct": metrics.get("bb_pct"),
+                        "swstr_pct": metrics.get("swstr_pct"),
+                        "csw_pct": metrics.get("csw_pct"),
+                    }
+                )
+            _render_table(skill_rows, max_rows=10)
 
         st.markdown("**Component Heatmap**")
-        _render_pitch_component_heatmap(edge_rows)
+        _render_pitch_component_heatmap(model_rows)
 
-        st.markdown("**Pick Cards**")
-        _render_pitch_pick_cards(edge_rows, max_cards=min(8, len(edge_rows)))
+        st.markdown("**Top Cards**")
+        cards = []
+        for row in model_rows[:8]:
+            components = ""
+            for label, value in (row.get("components") or {}).items():
+                try:
+                    component_value = max(0.0, min(100.0, float(value)))
+                except Exception:
+                    continue
+                components += (
+                    "<div class='component-row'>"
+                    f"<div class='component-label'>{html.escape(label.replace('_', ' '))}</div>"
+                    "<div class='component-track'>"
+                    f"<div class='component-fill' style='width:{component_value}%;'></div>"
+                    "</div>"
+                    f"<div class='component-value'>{component_value:.0f}</div>"
+                    "</div>"
+                )
+            metrics = row.get("pitcher_metrics") or {}
+            lineup = row.get("lineup_summary") or {}
+            primary_pitch = row.get("primary_pitch") or {}
+            pill_values = [
+                f"Expected {_safe_num(row.get('expected_stat'), 2)}",
+                f"K% {_safe_num(metrics.get('k_pct'), 1)}",
+                f"SwStr {_safe_num(metrics.get('swstr_pct'), 1)}",
+                f"Lineup K% {_safe_num(lineup.get('avg_hitter_k_pct'), 1)}",
+                str(primary_pitch.get("description") or primary_pitch.get("code") or "Pitch mix"),
+            ]
+            pills = "".join(f"<span class='mini-pill'>{html.escape(value)}</span>" for value in pill_values if value and "n/a" not in value.lower())
+            cards.append(
+                "<div class='pitch-card'>"
+                "<div class='pitch-head'>"
+                "<div>"
+                f"<div class='pitch-name'>{html.escape(str(row.get('pitcher', '')))}</div>"
+                f"<div class='pitch-sub'>{html.escape(str(row.get('team', '')))} vs {html.escape(str(row.get('opponent', '')))} - {html.escape(str(row.get('lineup_status', '')))}</div>"
+                "</div>"
+                f"<div class='edge-chip'>{html.escape(_safe_num(row.get('score'), 1))}</div>"
+                "</div>"
+                f"<div class='pitch-prop'>{html.escape(str(row.get('lean', '')).upper())} {html.escape(str(row.get('market_name') or row.get('bet_type', '')).replace('_', ' '))}</div>"
+                f"<div class='pitch-mini'>{pills}</div>"
+                f"<div class='component-stack'>{components}</div>"
+                "</div>"
+            )
+        if cards:
+            st.markdown(f"<div class='pitch-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
         with st.expander("Top Pick Breakdown", expanded=True):
-            reasons = best_edge.get("reasons") or []
+            reasons = best_model.get("reasons") or []
             if reasons:
                 st.markdown("**Why it rates well**")
                 for reason in reasons:
                     st.write(f"- {reason}")
-            lineup_players = ((best_edge.get("lineup_summary") or {}).get("players")) or []
+            lineup_players = best_lineup.get("players") or []
             if lineup_players:
                 st.markdown("**Projected lineup**")
                 _render_table(lineup_players, max_rows=12)
-            pitcher_metrics = best_edge.get("pitcher_metrics") or {}
-            if pitcher_metrics:
+            if best_metrics:
                 st.markdown("**Pitcher metrics**")
-                _render_table([pitcher_metrics], max_rows=5)
+                _render_table([best_metrics], max_rows=5)
             source_rows = [
                 {"source": key, "detail": value}
-                for key, value in (edge_payload.get("data_sources") or {}).items()
+                for key, value in (model_payload.get("data_sources") or {}).items()
             ]
             if source_rows:
                 st.markdown("**Data sources**")
                 _render_table(source_rows, max_rows=10)
 
-        with st.expander("Raw Edge Table"):
-            edge_table_rows = []
-            for row in edge_rows:
-                edge_table_rows.append(
+        with st.expander("Full Model Table"):
+            model_table_rows = []
+            for row in model_rows:
+                metrics = row.get("pitcher_metrics") or {}
+                lineup = row.get("lineup_summary") or {}
+                model_table_rows.append(
                     {
                         "pitcher": row.get("pitcher"),
                         "team": row.get("team"),
                         "opp": row.get("opponent"),
-                        "market": row.get("market_name"),
-                        "side": str(row.get("recommended_side", "")).upper(),
-                        "line": row.get("line"),
-                        "offered_odds": row.get("offered_odds"),
-                        "fair_odds": row.get("fair_odds_american"),
-                        "edge_pct": row.get("edge_pct"),
-                        "proj_prob": row.get("projected_probability"),
-                        "confidence": row.get("confidence"),
+                        "lean": str(row.get("lean", "")).upper(),
+                        "market": row.get("market_name") or row.get("bet_type"),
+                        "score": row.get("score"),
                         "expected_stat": row.get("expected_stat"),
                         "lineup_status": row.get("lineup_status"),
-                        "book": row.get("bookmaker_title") or row.get("bookmaker"),
+                        "k_pct": metrics.get("k_pct"),
+                        "bb_pct": metrics.get("bb_pct"),
+                        "csw_pct": metrics.get("csw_pct"),
+                        "swstr_pct": metrics.get("swstr_pct"),
+                        "opp_lineup_k_pct": lineup.get("avg_hitter_k_pct"),
+                        "avg_vs_primary_pitch": lineup.get("avg_vs_primary_pitch"),
                     }
                 )
-            _render_table(edge_table_rows, max_rows=50)
-    elif odds_enabled is not False and not edge_error and st.session_state.get("pitch_lab_edge_payload") is not None:
-        st.info("No priced edges met the current threshold. Lower Min Edge % or check another bookmaker.")
-
-    if model_rows:
-        st.markdown("---")
-        st.markdown("**Model Board**")
-        best_model_score = max(float(row.get("score", 0) or 0) for row in model_rows)
-        _render_metric_cards(
-            [
-                ("Pitchers Ranked", str(len(model_rows))),
-                ("Top Score", _safe_num(best_model_score, 1)),
-                ("Slate Date", str(model_payload.get("date") or "")),
-                ("Model Version", str(model_payload.get("model_version") or "")),
-            ]
-        )
-        model_chart_rows = [
-            {
-                "pick": f"{row.get('pitcher', '')} {str(row.get('lean', '')).upper()} {str(row.get('bet_type', '')).replace('_', ' ')}",
-                "score": float(row.get("score", 0) or 0),
-            }
-            for row in model_rows[:12]
-        ]
-        _render_bars(model_chart_rows, "pick", "score", color="#2f80ed")
-
-        model_table_rows = []
-        for row in model_rows:
-            model_table_rows.append(
-                {
-                    "pitcher": row.get("pitcher"),
-                    "team": row.get("team"),
-                    "opp": row.get("opponent"),
-                    "bet_type": row.get("bet_type"),
-                    "lean": str(row.get("lean", "")).upper(),
-                    "score": row.get("score"),
-                    "confidence": row.get("confidence"),
-                    "lineup_status": row.get("lineup_status"),
-                    "k_pct": (row.get("pitcher_metrics") or {}).get("k_pct"),
-                    "bb_pct": (row.get("pitcher_metrics") or {}).get("bb_pct"),
-                    "swstr_pct": (row.get("pitcher_metrics") or {}).get("swstr_pct"),
-                    "csw_pct": (row.get("pitcher_metrics") or {}).get("csw_pct"),
-                }
-            )
-        _render_table(model_table_rows, max_rows=40)
+            _render_table(model_table_rows, max_rows=60)
     elif not model_error and st.session_state.get("pitch_lab_model_payload") is not None:
         st.info("No pitchers cleared the current model score threshold for this slate.")
 
